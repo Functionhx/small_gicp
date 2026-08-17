@@ -484,3 +484,18 @@ doi = {10.21105/joss.06948}
 ## Contact
 
 [Kenji Koide](https://staff.aist.go.jp/k.koide/), National Institute of Advanced Industrial Science and Technology (AIST)
+
+## GPU acceleration (cuda-x86 / cuda-jetson branches)
+
+The `cuda-x86` branch contains `cuda/`, a GPU-native reimplementation of the registration
+pipeline (GICP scan-to-scan and VGICP scan-to-model) built on voxel-bucket spatial indexes and
+a deterministic fp64 reduction scheme. See [BENCHMARK_GPU.md](BENCHMARK_GPU.md) for accuracy
+parity and speedup details (9.2x / 8.7x end-to-end vs the upstream CPU pipeline on a 60-frame
+real LiDAR sequence, RTX 4070).
+
+```bash
+cmake -B build_cuda -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build_cuda -j$(nproc)
+ctest --test-dir build_cuda                      # 20 kernel-parity tests
+./build_cuda/cuda/odometry_gpu <velodyne_dir> --exec full-gpu --engine gicp
+```

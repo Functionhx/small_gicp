@@ -138,3 +138,9 @@
 2. 逐体素剪枝（体素最近距离² ≥ 参考距离² 跳过）。
 3. 60 帧真实序列 GICP：27.75→**16.33ms**（p50），vs CPU 150.7ms = **9.2×**；APE 与逐线程版逐位一致（0.532m）。
 4. 结论：NN 内核提速后协方差（5.3ms）成为最大单项；launch 开销占比小，CUDA Graph 低 ROI 暂缓；流重叠留 Orin 移植期。
+
+## 2026-08-18 · T13：报告与收尾
+
+- BENCHMARK_GPU.md：60 帧真实序列 GICP 9.2×/VGICP 8.7×、单帧精度表、内核级对拍、流水线分解、复现步骤。README 增加 GPU 构建节。
+- 待办（用户协助）：KITTI00.tar.gz（622MB）浏览器下载放 ~/datasets/kitti/odometry/ → 正式 APE/RPE 验收 → 若过再设 default 分支（用户原条件"验证完成后"）。
+- jetson 移植要点已写入设计文档 §11。
