@@ -98,6 +98,21 @@ Notes (kept honest):
   with ours additionally reproducing upstream GICP/VGICP results to <=0.01%.
 - Feeding cuICP raw (undownsampled) 120k-point frames is not a meaningful benchmark (~4.2 s/frame).
 
+## Ablations (official KITTI-00, 100 frames, GICP, p50 msec/frame)
+
+| NN strategy (full-gpu) | time | | exec mode | time |
+|---|---|---|---|---|
+| voxel3 | 5.86 | | full-gpu | **5.99** |
+| voxel5 (default) | 5.92 | | hybrid | 27.75 |
+| exact-bf | 12.79 | | cpu (upstream serial) | 44.28 |
+| | | | cpu-omp (upstream, 8T) | 42.24 |
+
+Notes: voxel3 ~= voxel5 because the adaptive window expansion makes the base window size
+moot; exact-bf costs 2.2x for identical results (used as the validation path). Upstream's
+multithreaded CPU mode gains ~nothing on a Ryzen 9950X (16T = 42.0 ms): the serial
+`std::sort`-based downsampling is an Amdahl wall on fast desktop cores, and the Orin CPU is
+far weaker — the GPU advantage holds against upstream's best CPU configuration everywhere.
+
 ## Pipeline breakdown (RTX 4070, 120k-pt frame -> ~35k voxels)
 
 | stage | time |
