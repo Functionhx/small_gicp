@@ -1,20 +1,44 @@
 # small_gicp-cuda
 
-**CUDA-exclusive point cloud registration for NVIDIA GPUs** — desktop dGPUs and Jetson.
+**CUDA-exclusive point cloud registration for NVIDIA GPUs** — desktop dGPUs and Jetson modules.
+[中文说明](README_zh.md)
+
 GICP (scan-to-scan) and VGICP (scan-to-model) reimplemented GPU-native, with bit-level
 fidelity to the CPU reference and single-frame latencies in the milliseconds.
 
-- **No CPU fallback.** An NVIDIA GPU (or Jetson module) is required.
-- **Accuracy parity by construction**: every kernel is tested against the CPU reference
-  implementation (kept in-tree under `include/small_gicp`); on official KITTI odometry data
-  the full pipeline reproduces the CPU result to **<=0.01% APE/RPE**.
-- **Speed**: 7.3x (GICP) / 6.1x (VGICP) over the single-thread CPU reference on an RTX 4070
-  (6.0 / 5.6 msec per 120k-point frame end-to-end, including downsampling and covariance
-  estimation); the gap widens on Jetson-class CPUs. See [BENCHMARK_GPU.md](BENCHMARK_GPU.md)
-  for the full comparison, including a fair match-up against NVIDIA cuPCL's cuICP.
-- **Deterministic**: fixed launch configurations and fp64 reductions give run-to-run
-  bit-identical results — a property the CPU reference itself does not guarantee under
-  thread scheduling.
+## Results
+
+| device | engine | CPU ref (upstream, serial) | this work (GPU) | speedup | GPU vs CPU accuracy |
+|---|---|---|---|---|---|
+| RTX 4070 + Ryzen 9950X | GICP | 43.9 ms | **6.0 ms** | 7.3x | APE/RPE diff <= 0.01% |
+| RTX 4070 + Ryzen 9950X | VGICP | 34.4 ms | **5.6 ms** | 6.1x | <= 0.01% |
+| Jetson Orin NX (MAXN) | GICP | 118.3 ms | **16.5 ms** | 7.2x | 1.2 cm over 100 frames |
+| Jetson Orin NX (MAXN) | VGICP | 102.3 ms | **14.2 ms** | 7.2x | 0.2 cm over 100 frames |
+
+KITTI odometry seq 00 (official data + GT), 100 frames, timing includes downsampling +
+covariance estimation + registration. Full methodology: [BENCHMARK_GPU.md](BENCHMARK_GPU.md)
+(includes a fair comparison against NVIDIA cuPCL's cuICP: 1.6x faster at matched inputs).
+
+Cross-architecture determinism: the GPU pipeline produces **bit-identical trajectories on
+sm_87 and sm_89** (APE = 0.0000 m across devices).
+
+## How this differs from the original small_gicp
+
+| | small_gicp (upstream) | small_gicp-cuda (this repo) |
+|---|---|---|
+| Target | CPU (header-only, OpenMP/TBB optional) | **NVIDIA GPU required** (dGPU or Jetson), no CPU fallback |
+| Spatial index | kd-tree (nanoflann-style) per cloud | **radix-sorted voxel buckets + O(1) hash** built by downsampling itself — one pass serves downsampling, covariance kNN, correspondence search, and the incremental voxel map; no kd-tree anywhere |
+| Covariance kNN | kd-tree exact kNN | warp-cooperative expanding-shell search with a rigorous early-stop bound (exact), brute-force completion for sparse clouds |
+| Correspondence | kd-tree NN per iteration | warp-cooperative batch NN: 5^3 window + adaptive expansion with per-voxel pruning |
+| Precision | all double | fp32 storage/factor math + **fp64 warp reductions** and CPU double LM solve |
+| Determinism | threaded CPU reductions are scheduling-dependent | fixed launch configs + ordered reductions: **run-to-run and cross-SM-architecture bit-identical** |
+| Engines | ICP / Plane-ICP / GICP / VGICP via templates | GICP + VGICP (`sgc::GicpGpu`, `sgc::VgicpGpu`), LM constants ported line-by-line from upstream |
+| Extras | PCL adapter, ROS bridge, Python bindings | none of those (yet) — the CPU reference stays in-tree as the parity baseline |
+| Verification | upstream test suite | upstream kept unmodified + **20 kernel-parity tests** that build both implementations and assert agreement (downsampling, covariance, NN, H/b/e, voxel map, end-to-end) |
+
+The upstream CPU implementation is kept unmodified in-tree (`include/small_gicp`, `src/`)
+exactly because the parity suite needs it: this repo's accuracy claim is "identical to
+upstream", tested kernel by kernel. The `master` branch tracks the upstream baseline.
 
 ## Quick start
 
@@ -36,39 +60,26 @@ ctest --test-dir build          # 20 kernel-parity tests (GPU required)
 
 sgc::GpuCloud target = sgc::GpuCloud::from_host(target_points);   // std::vector<Eigen::Vector4f>
 sgc::Downsampler downsampler;
-downsampler.run(target, target_points.size(), 0.25);              // sorted voxel buckets + hash index
-sgc::estimate_covariances(target, 0.25f, 20);                     // exact kNN-20 covariance (GPU)
+downsampler.run(target, target_points.size(), 0.25);              // voxel buckets + hash index
+sgc::estimate_covariances(target, 0.25f, 20);                     // exact kNN-20 covariance
 
 sgc::GicpGpu reg;                                                 // LM constants = upstream
-auto result = reg.align(target, source, init_T, 0.25f);           // RegistrationResult-equivalent
+auto result = reg.align(target, source, init_T, 0.25f);
 ```
 
-VGICP scan-to-model: `sgc::VoxelHashMap` (incremental Gaussian voxel map, LRU) +
+VGICP scan-to-model: `sgc::VoxelHashMap` (incremental Gaussian voxel map with LRU) +
 `sgc::VgicpGpu::align(...)`. Benchmark harness with runtime-switchable policies:
 `cuda/bench/odometry_gpu` (`--exec full-gpu|hybrid|cpu --engine gicp|vgicp --nn voxel3|voxel5|exact-bf`).
 
-## Architecture (one paragraph)
-
-Downsampling's radix-sorted voxel buckets double as the spatial index — no kd-trees anywhere.
-O(1) hash probes power the covariance kNN (warp-cooperative shells with a rigorous early-stop
-bound), correspondence search (adaptive window + pruned sphere expansion), and the incremental
-voxel map. Per-point factor math runs in fp32, warp-shuffle reductions promote to fp64 with
-fixed slot assignment, and the 6x6 LM solve runs on the CPU in double precision.
-
 ## Documentation
 
-[BENCHMARK_GPU.md](BENCHMARK_GPU.md) results & methodology · [JETSON.md](JETSON.md) (cuda-jetson branch)
-device deployment · [WORKLOG.md](WORKLOG.md) engineering log ·
+[BENCHMARK_GPU.md](BENCHMARK_GPU.md) results & methodology · [JETSON.md](JETSON.md) (cuda-jetson
+branch) device deployment · [WORKLOG.md](WORKLOG.md) engineering log ·
 [docs/superpowers/specs](docs/superpowers/specs/) design doc ·
 [README_upstream.md](README_upstream.md) original CPU library README.
 
-## Relation to upstream small_gicp
+## Credits & license
 
-This repository is a CUDA-exclusive derivative of [koide3/small_gicp](https://github.com/koide3/small_gicp)
-(MIT). The upstream CPU implementation is kept unmodified in-tree (`include/small_gicp`,
-`src/`) as the accuracy reference: the parity test suite builds both and asserts agreement
-kernel by kernel. The `master` branch tracks the upstream baseline this work started from.
-
-## License
-
-MIT (inherited from upstream small_gicp; bundled nanoflann/Sophus licenses apply as in upstream).
+Derivative of [koide3/small_gicp](https://github.com/koide3/small_gicp) by Kenji Koide (AIST),
+MIT license inherited. If you use this work, please cite the upstream JOSS paper for the
+algorithms and this repository for the CUDA implementation.

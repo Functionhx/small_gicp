@@ -23,6 +23,22 @@ Acceptance gate (APE/RPE within 5% of upstream): **PASS for both engines**. Data
 directly from the official `avg-kitti` S3 zip (`scripts/fetch_kitti00_range.py`); the Google Drive
 subset referenced by upstream BENCHMARK.md is dead (404).
 
+### Jetson Orin NX (target device, MAXN mode, CUDA 12.2, on-device build sm_87)
+
+Same 100-frame official KITTI-00 protocol, on-device build, 20/20 parity tests passing on the
+Orin GPU. Cross-device determinism: GPU trajectories are bit-identical to the x86 GPU runs
+(APE = 0.0000 m across sm_87 vs sm_89 for both engines).
+
+| engine | exec | p50 [msec/frame] | speedup | fps | GPU vs CPU (on Orin) |
+|---|---|---|---|---|---|
+| GICP  | cpu (upstream serial) | 118.3 | 1.0x | 8.2 | reference |
+| GICP  | full-gpu | **16.5** | **7.2x** | 56 | APE 1.2 cm / 100 f |
+| VGICP | cpu (upstream serial) | 102.3 | 1.0x | 9.5 | reference |
+| VGICP | full-gpu | **14.2** | **7.2x** | 63 | APE 0.2 cm / 100 f |
+
+Note: the Orin CPU baseline is 2.7x slower than the desktop Ryzen (as expected for A78AE);
+clocks were at MAXN but not pinned (`jetson_clocks` needs sudo on the test unit).
+
 ### 60-frame real LiDAR sequence (KITTI object3d training, consecutive frames 0-59)
 
 Worst-case regime: partial overlap (~40-55% inliers) with identity initialization, so both implementations run full 20 LM iterations per frame.

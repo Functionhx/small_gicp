@@ -170,3 +170,11 @@
 - cupcl_bench 补 cuPCL 库获取与构建说明（不 vendor 其 .so，指路官方仓库）。
 - README 增加文档导览图。
 - 打 tag `v1.0.0-gpu`（论文工件引用锚点，可配 Zenodo DOI）。
+
+## 2026-08-18 · Orin NX 设备端验证（B 轨道完成）+ CUDA 专属定位
+
+- **发现 fyc-jetson 主机在线**（R36.3/JetPack6，CUDA 12.2，Orin）。rsync 源码+数据 → 设备端 sm_87 构建 → **20/20 对拍测试全过**。
+- **Orin 基准（官方 KITTI-00 100 帧，MAXN）**：GICP 118.3→16.5ms（**7.2×**，56fps）、VGICP 102.3→14.2ms（**7.2×**，63fps）。Orin CPU 基线比 9950X 慢 2.7×，符合 A78AE 预期。
+- **跨架构确定性实证**：Orin-GPU 与 x86-GPU 轨迹 APE=0.0000m（双引擎）——fp32+确定性归约设计在 sm_87/sm_89 间逐位复现。
+- 坑：rsync 软链数据未解引用导致设备端空云秒测（0.01ms 假结果）——重传 `-L` 实文件修复。
+- 定位变更（用户）：CUDA 专属库（独显+Jetson，无 CPU 回退）。README 重写为双语（README.md / README_zh.md），核心=与原版 small_gicp 的逐项区别表。仓库清理：删 6 个上游遗留分支（gh-pages/oct/paper/py/pybench/vox_vs_vox），留 cuda-x86(默认)/cuda-jetson/master(上游基线)。SSH 推送（github-functionhx 别名）解决 workflow scope；CI cuda-build 上线（sm_89+sm_87 双架构编译验证）。
