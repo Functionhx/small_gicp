@@ -487,6 +487,8 @@ doi = {10.21105/joss.06948}
 
 ## GPU acceleration (cuda-x86 / cuda-jetson branches)
 
+Docs map: [BENCHMARK_GPU.md](BENCHMARK_GPU.md) (results & methodology) · [JETSON.md](JETSON.md, cuda-jetson branch) (device deployment) · [WORKLOG.md](WORKLOG.md) (engineering log) · [docs/superpowers/specs](docs/superpowers/specs/) (design doc)
+
 The `cuda-x86` branch contains `cuda/`, a GPU-native reimplementation of the registration
 pipeline (GICP scan-to-scan and VGICP scan-to-model) built on voxel-bucket spatial indexes and
 a deterministic fp64 reduction scheme. See [BENCHMARK_GPU.md](BENCHMARK_GPU.md) for accuracy

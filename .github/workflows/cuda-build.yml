@@ -1,0 +1,32 @@
+name: cuda-build
+
+# Compile-only validation of the GPU implementation (sgc) on GPU-less hosted runners.
+# Test binaries are built but not executed (DISCOVERY_MODE PRE_TEST); the kernel parity
+# suite runs on CUDA-equipped machines / the Jetson device per BENCHMARK_GPU.md.
+
+on:
+  push:
+    branches: [cuda-x86, cuda-jetson]
+  pull_request:
+    branches: [cuda-x86, cuda-jetson]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git cmake build-essential libeigen3-dev libgtest-dev
+      - uses: actions/checkout@v4
+      - name: Configure (sm_89)
+        run: cmake -B build_cuda -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build_cuda -j$(nproc)
+      - name: Configure (sm_87, Jetson cross-check)
+        run: cmake -B build_jetson -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=87
+      - name: Build (sm_87)
+        run: cmake --build build_jetson -j$(nproc)

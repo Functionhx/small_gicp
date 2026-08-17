@@ -1,4 +1,15 @@
 // cuPCL cudaICP odometry benchmark on KITTI-00 (same loop policy as odometry_gpu).
+//
+// Requires the NVIDIA cuPCL prebuilt libraries (MIT):
+//   git clone -b x86_64_lib --depth 1 https://github.com/NVIDIA-AI-IOT/cuPCL.git /tmp/cuPCL_x86
+// Build:
+//   g++ -std=c++17 -O2 cupcl_bench.cpp \
+//     -I /tmp/cuPCL_x86/cuICP/lib -I /tmp/cuPCL_x86/cuFilter/lib \
+//     -I /usr/local/cuda/include -I /usr/include/eigen3 -o cupcl_bench \
+//     -L /tmp/cuPCL_x86/cuICP/lib -L /tmp/cuPCL_x86/cuFilter/lib \
+//     -lcudaicp -lcudafilter -lcudart -L /usr/local/cuda/lib64 \
+//     -Wl,-rpath,/tmp/cuPCL_x86/cuICP/lib -Wl,-rpath,/tmp/cuPCL_x86/cuFilter/lib
+// Modes: raw | down (CPU downsample, timed) | gpu (cuFilter downsample, timed)
 #include <chrono>
 #include <cstdio>
 #include <cstring>
