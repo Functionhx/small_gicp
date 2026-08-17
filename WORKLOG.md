@@ -25,3 +25,10 @@
 - smoke_test 2 用例通过；无 CUDA 默认配置不受影响。
 - 坑位记录：(1) worktree 内构建源路径是 `..` 而非 `../..`；(2) `enable_testing()` 必须在顶层调用；(3) .cpp 测试链 CUDA 头需 `CUDA::cudart`；(4) `<<<>>>` 只能在 .cu，host 包装命名 `launch_*`。
 - 决策：执行方式为会话内联（GPU 编译-运行-调试循环紧）。
+
+## 2026-08-17 · T2 完成：IO + GpuCloud
+
+- `sgc::io::read_ply`（移植 upstream，修正了任意 stride 读取）+ `read_kitti_bin`。
+- `sgc::GpuCloud`：points(float4)/covs(9f)/keys(u64) 三缓冲 + 宿主互转助手。
+- io_test 2 用例通过（data/target.ply 69088 点，4 属性 stride=4）。
+- 坑位：file(GLOB) 配置期求值，新增源文件要重跑 cmake。
