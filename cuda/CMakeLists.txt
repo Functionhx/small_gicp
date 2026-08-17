@@ -11,6 +11,7 @@ add_library(sgc STATIC
   src/search/nn.cu
   src/reg/linearize.cu
   src/reg/gicp.cu
+  src/reg/vgicp.cu
 )
 target_include_directories(sgc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

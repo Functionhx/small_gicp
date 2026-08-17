@@ -92,3 +92,11 @@
 - `VoxelHashMap`：开放寻址（slot=表位）、排序 run 串行累加 + 每体素每帧一次原子（跨帧确定性）、finalize 写独立 mean/cov、LRU horizon/cycle 移植、倍增 grow 全载荷迁移。
 - Parity：与 upstream GaussianVoxelMap 双帧插入对拍——体素数一致、mean<1e-3、cov<2e-2（fp32 原子和 vs double）；确定性测试逐位通过。
 - **调试教训（1.5h 排查）**：对拍失败根因是测试 dump 函数 `download(..., cap)` 少乘 9（只填前 1/9，槽位靠后的体素全零）。GPU 实现自始正确。排查路径：sum_cov 直读→finalize 直读→槽位 TRACE→同一循环双路对质→定位 dump 笔误。过程中顺手修掉两个真 bug：槽累加数组未清零（依赖 cudaMalloc 零页）、grow() 丢载荷。
+
+## 2026-08-17 · T9 完成：VgicpGpu 引擎 + 越界 bug 根治
+
+- `VgicpGpu::align`：中心体素单探（与 upstream `set_search_offsets(1)` 同义）+ 同款 LM 循环 + CorrCache 误差重评。合成对与 upstream 对拍通过（<1cm/0.3°）。
+- **重大 bug 修复（影响 GICP 与 VGICP 两引擎）**：尾块中 `i≥num_source` 的线程仍执行 warp 归约并写 `partials[warp_id*43]`——缓冲按 ceil(n/32) 分配而实际发射 ceil(n/256)×8 个 warp → 越界写 ~2.4KB 到相邻缓冲。症状随分配布局漂移：slot=0 幽灵对应、M 缓存 NaN、结果非确定。修复=按发射 warp 数分配（两处）。
+- **调试方法论收获**：症状"矛盾"（e 有限但缓存 NaN）+ 非确定性 ⇒ 立即上 compute-sanitizer，比继续打补丁快一个量级。inv3 加了行列式下限保护（防御 NaN 输入）。
+- 数据集状态（用户询问）：KITTI 00 尚未下载（T11 执行）；本地 object3d 约 6GB 为会话前已有。
+- 测试：20/20，sanitizer 0 错误。

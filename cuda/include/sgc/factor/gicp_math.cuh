@@ -39,7 +39,8 @@ __device__ __forceinline__ M3 inv3(const M3& a) {
   const float c01 = a.at(1, 2) * a.at(2, 0) - a.at(1, 0) * a.at(2, 2);
   const float c02 = a.at(1, 0) * a.at(2, 1) - a.at(1, 1) * a.at(2, 0);
   const float det = a.at(0, 0) * c00 + a.at(0, 1) * c01 + a.at(0, 2) * c02;
-  const float inv_det = 1.0f / det;
+  // Guard against singular / underflowed determinants (NaN/Inf poisoning the linearized system)
+  const float inv_det = 1.0f / (fabsf(det) < 1e-30f ? (det < 0.0f ? -1e-30f : 1e-30f) : det);
 
   M3 r;
   r.at(0, 0) = c00 * inv_det;

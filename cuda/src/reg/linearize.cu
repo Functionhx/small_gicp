@@ -190,7 +190,9 @@ void Linearizer::prepare(size_t num_source) {
   if (d_T_.size() != 16) {
     d_T_.resize(16);
   }
-  const size_t num_warps = (num_source + 31) / 32;
+  // Every launched warp (including tail warps covering only out-of-range threads) writes its
+  // partial slot; size the buffer by the launched warp count, not by ceil(n / 32).
+  const size_t num_warps = ((num_source + block_ - 1) / block_) * (block_ / 32);
   if (num_warps_ != num_warps) {
     partials_.resize(num_warps * NUM_OUT);
     num_warps_ = num_warps;
