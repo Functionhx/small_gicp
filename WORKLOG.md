@@ -49,3 +49,9 @@
   3. 二次修复：n==k 但壳耗尽未触发早停的集合也不精确 → 高位 bit 标记未终止，pass-2 暴力重算（修掉 p99 0.76→1e-3）。
   4. 残差 ~0.1% 点为 k 边界等距 tie（kd-tree 与排序插入选点不同），影响 ≤2e-3，无害。
 - 结论：协方差搜索从此**精确**等价 kd-tree kNN（除 tie），无需策略参数。
+
+## 2026-08-17 · T5 完成：NN 策略
+
+- `nn_query.cuh`（device 模板，voxel3/voxel5 立方探查 + ExactBF 线性全扫）+ `nn_search.hpp/cu`（宿主批查 API）。
+- 一致率（data/target.ply @0.25m，60k 点，kd-tree 参考）：ExactBF 全等（same-index>99.9%）；Voxel3 <1% 不一致；Voxel5 <0.2%。
+- ExactBF 60k×60k 在 4070 上 ~0.1s——作为对照/验收路径完全可用。
