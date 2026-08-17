@@ -38,3 +38,14 @@
 - `voxel_key.hpp`（fast_floor/21bit×3 打包/解包，host+device）+ `Downsampler`（keys → CUB radix sort → run flags → ExclusiveSum/CSR → 每桶一 block fp64 树归约质心）。
 - ParityWithUpstream 通过：桶数、key 升序、质心 1e-4 内与 upstream 一致（data/target.ply, 69088→N 点 @0.25m）。
 - 坑位：(1) 上游 voxelgrid_sampling 对 vector<Vector4f> 输出需显式 OutputPointCloud=small_gicp::PointCloud；(2) CUB 输出缓冲（reduce_out_）必须显式分配。
+
+## 2026-08-17 · T4 完成：协方差估计
+
+- 内核：自适应扩张壳精确 kNN（早停界 = 到当前立方体边界的最近距离）+ 稀疏点第二遍暴力补全 + Jacobi 3x3 特征分解 + `cov = I − 0.999·n·nᵀ`。
+- Parity：median<1e-4、p99<1e-3、p99.9<5e-3、max 1.8e-2（孤立 tie 离群）；确定性测试通过（逐位一致）。
+- **调试记录（重要）**：
+  1. 初版固定 5³ 邻域 top-20 → 中位误差 3.4e-2。CPU 复现隔离证明：邻居集合相同时数学 100% 正确（bad_with_same_set=0），错误全来自集合差异——KITTI 户外第 20 近邻常在 ±0.5m 外。
+  2. 早停界推导：查询点在自身体素内分数坐标 f，越出 s-cube 的最小世界距离 = (s + min_axis(f,1−f))·leaf。
+  3. 二次修复：n==k 但壳耗尽未触发早停的集合也不精确 → 高位 bit 标记未终止，pass-2 暴力重算（修掉 p99 0.76→1e-3）。
+  4. 残差 ~0.1% 点为 k 边界等距 tie（kd-tree 与排序插入选点不同），影响 ≤2e-3，无害。
+- 结论：协方差搜索从此**精确**等价 kd-tree kNN（除 tie），无需策略参数。
