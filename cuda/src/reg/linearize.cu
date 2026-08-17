@@ -71,7 +71,7 @@ __global__ void linearize_kernel(
       }
     } else {
       float d2 = 0.0f;
-      nn_query<Strategy>(hidx, target_keys, num_target, target_pts, make_float4(q.x, q.y, q.z, 1.0f), inv_leaf, &j, &d2);
+      nn_query<Strategy>(hidx, target_keys, num_target, target_pts, make_float4(q.x, q.y, q.z, 1.0f), inv_leaf, 4.0f / (inv_leaf * inv_leaf), &j, &d2);
 
       if (j >= 0 && d2 <= max_dist_sq) {
         // M = (Ct + R * Cs * R^T)^-1

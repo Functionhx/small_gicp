@@ -25,7 +25,7 @@ __global__ void nn_kernel(
   if (i >= num_queries) {
     return;
   }
-  nn_query<Strategy>(hidx, keys, num_keys, pts, queries[i], inv_leaf, out_idx + i, out_d2 + i);
+  nn_query<Strategy>(hidx, keys, num_keys, pts, queries[i], inv_leaf, 4.0f / (inv_leaf * inv_leaf), out_idx + i, out_d2 + i);
 }
 
 }  // namespace

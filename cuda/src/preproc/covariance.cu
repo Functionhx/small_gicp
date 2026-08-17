@@ -145,9 +145,13 @@ __device__ __forceinline__ bool lex_less(float d2_a, int j_a, float d2_b, int j_
 constexpr int COV_BLOCK = 128;
 constexpr int COV_STRIDE = MAX_K + 1;
 
-// Pass 1: adaptive expanding-shell exact kNN over voxel buckets with a rigorous early-stop bound.
-//        Only shells 0..2 are probed: dense clouds terminate there; sparse points fall through
-//        to the warp-per-query brute-force pass, which is cheaper than deep shell expansion.
+// Pass 1 (warp-cooperative): exact kNN over voxel buckets with a rigorous early-stop bound.
+//        One warp per point: lanes stride over each shell's voxels (latency hidden), hits are
+//        merged into a shared-memory top-k by lane 0 with lexicographic (dist, index) ordering.
+//        Exact for every point whose k-th neighbor lies within MAX_SHELL voxels.
+constexpr int COV_WARPS = 8;
+constexpr int COV_WSTRIDE = MAX_K + 1;
+
 __global__ void covariance_shell_kernel(
   HashIndexView hidx,
   const float4* points,
@@ -157,19 +161,29 @@ __global__ void covariance_shell_kernel(
   int num_neighbors,
   float* covs,
   unsigned int* counts) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  __shared__ float sdist[COV_BLOCK][COV_STRIDE];
-  __shared__ int sidx[COV_BLOCK][COV_STRIDE];
-  float* dist = sdist[threadIdx.x];
-  int* idx = sidx[threadIdx.x];
-  int n = 0;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x / 32;
+  const int query = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
 
-  if (i >= num_points) {
+  __shared__ float s_d2[COV_WARPS][COV_WSTRIDE];
+  __shared__ int s_j[COV_WARPS][COV_WSTRIDE];
+  __shared__ int s_n[COV_WARPS];
+  __shared__ int s_stop[COV_WARPS];
+
+  float* d2 = s_d2[warp];
+  int* jj = s_j[warp];
+  if (lane == 0) {
+    s_n[warp] = 0;
+    s_stop[warp] = 0;
+  }
+  __syncwarp();
+
+  if (query >= num_points) {
     return;
   }
 
-  const float4 pi = points[i];
-  const VoxelCoord ci = key_coord(keys[i]);
+  const float4 pi = points[query];
+  const VoxelCoord ci = key_coord(keys[query]);
 
   // Position of the point inside its own voxel, in [0, 1)
   const float fx = pi.x * inv_leaf - floorf(pi.x * inv_leaf);
@@ -177,65 +191,75 @@ __global__ void covariance_shell_kernel(
   const float fz = pi.z * inv_leaf - floorf(pi.z * inv_leaf);
   const float frac_min = fminf(fminf(fminf(fx, 1.0f - fx), fminf(fy, 1.0f - fy)), fminf(fz, 1.0f - fz));
 
-  // With the O(1) hash index, shells are cheap; the early-stop bound exits dense clouds at
-  // shell 1-3 and most semi-sparse points by shell 4-8. Points that cannot fill k neighbors
-  // within the cap keep their partial sets on large clouds (no O(N^2) fallback there).
-  constexpr int MAX_SHELL = 4;
-  bool terminated = false;
-  for (int s = 0; s <= MAX_SHELL && n < num_neighbors; s++) {
-    // Probe only shell s (voxels with max|offset| == s), pruning voxels whose closest point
-    // is provably farther than the current k-th best (gap measured in voxel units).
-    const float prune_thresh = n == num_neighbors ? dist[n - 1] * inv_leaf * inv_leaf : 3.4e38f;
-    for (int ox = -s; ox <= s; ox++) {
-      const float gx = ox == 0 ? 0.0f : (abs(ox) - 1 + (ox > 0 ? 1.0f - fx : fx));
-      for (int oy = -s; oy <= s; oy++) {
-        const float gy = oy == 0 ? 0.0f : (abs(oy) - 1 + (oy > 0 ? 1.0f - fy : fy));
-        for (int oz = -s; oz <= s; oz++) {
-          if (max(max(abs(ox), abs(oy)), abs(oz)) < s) {
-            continue;
-          }
-          const float gz = oz == 0 ? 0.0f : (abs(oz) - 1 + (oz > 0 ? 1.0f - fz : fz));
-          if (gx * gx + gy * gy + gz * gz > prune_thresh) {
-            continue;  // any point in this voxel is strictly farther than the k-th best
-          }
+  // Warp-cooperative shells stay cheap far beyond the per-thread version
+  constexpr int MAX_SHELL = 12;
+  for (int s = 0; s <= MAX_SHELL && s_stop[warp] == 0; s++) {
+    const int n3 = (2 * s + 1) * (2 * s + 1) * (2 * s + 1);
+
+    // Round-based scan: each round every lane probes one voxel, then all 32 candidates
+    // are merged into the shared top-k one at a time (no candidate is dropped).
+    for (int base = 0; base < n3; base += 32) {
+      const int t = base + lane;
+      float cand_d2 = 3.4e38f;
+      int cand_j = -1;
+      if (t < n3) {
+        const int ox = t / ((2 * s + 1) * (2 * s + 1)) - s;
+        const int rem = t % ((2 * s + 1) * (2 * s + 1));
+        const int oy = rem / (2 * s + 1) - s;
+        const int oz = rem % (2 * s + 1) - s;
+        if (max(max(abs(ox), abs(oy)), abs(oz)) == s) {
           const VoxelCoord coord{ci.x + ox, ci.y + oy, ci.z + oz};
           const unsigned long long key = coord_key(coord);
           const int j = hidx.ready() ? hash_lookup(hidx, key) : find_voxel(keys, num_points, key);
-          if (j < 0) {
-            continue;
-          }
-          const float4 pj = points[j];
-          const float dx = pi.x - pj.x, dy = pi.y - pj.y, dz = pi.z - pj.z;
-          const float d2 = dx * dx + dy * dy + dz * dz;
-          if (n < num_neighbors || lex_less(d2, j, dist[n - 1], idx[n - 1])) {
-            int k = n < num_neighbors ? n++ : num_neighbors - 1;
-            while (k > 0 && lex_less(d2, j, dist[k - 1], idx[k - 1])) {
-              dist[k] = dist[k - 1];
-              idx[k] = idx[k - 1];
-              k--;
-            }
-            dist[k] = d2;
-            idx[k] = j;
+          if (j >= 0) {
+            const float4 pj = points[j];
+            const float dx = pi.x - pj.x, dy = pi.y - pj.y, dz = pi.z - pj.z;
+            cand_d2 = dx * dx + dy * dy + dz * dz;
+            cand_j = j;
           }
         }
+      }
+
+      unsigned int mask = __ballot_sync(0xffffffffu, cand_j >= 0);
+      while (mask != 0) {
+        const int l = __ffs(mask) - 1;
+        mask &= mask - 1;
+        const float cd2 = __shfl_sync(0xffffffffu, cand_d2, l);
+        const int cj = __shfl_sync(0xffffffffu, cand_j, l);
+        if (lane == 0) {
+          const int n = s_n[warp];
+          if (n < num_neighbors || lex_less(cd2, cj, d2[n - 1], jj[n - 1])) {
+            int k = n < num_neighbors ? s_n[warp]++ : num_neighbors - 1;
+            while (k > 0 && lex_less(cd2, cj, d2[k - 1], jj[k - 1])) {
+              d2[k] = d2[k - 1];
+              jj[k] = jj[k - 1];
+              k--;
+            }
+            d2[k] = cd2;
+            jj[k] = cj;
+          }
+        }
+        __syncwarp();
       }
     }
 
     // Early stop: the k-th best is closer than the nearest point outside the current cube
-    if (n == num_neighbors) {
+    if (s_n[warp] >= num_neighbors) {
       const float bound = (frac_min + s) / inv_leaf;
-      if (dist[n - 1] <= bound * bound) {
-        terminated = true;
-        break;
+      if (lane == 0 && d2[num_neighbors - 1] <= bound * bound) {
+        s_stop[warp] = 1;
       }
+      __syncwarp();
     }
   }
 
-  // High bit marks an unterminated search that the brute-force pass (small clouds only) redoes.
-  counts[i] = terminated ? static_cast<unsigned int>(n) : (static_cast<unsigned int>(n) | 0x80000000u);
-  // Always compute the covariance from the found set: on large clouds there is no brute-force
-  // pass, so unterminated points keep their partial (k < num_neighbors) neighbor sets.
-  compute_cov_from_neighbors(points, idx, n, covs + i * 9);
+  if (lane == 0) {
+    const int n = s_n[warp];
+    // Only a search that fired the early-stop bound is provably exact; anything else
+    // (including a full set at the shell cap) falls through to the brute-force pass.
+    counts[query] = s_stop[warp] != 0 ? static_cast<unsigned int>(n) : (static_cast<unsigned int>(n) | 0x80000000u);
+    compute_cov_from_neighbors(points, jj, n, covs + query * 9);
+  }
 }
 
 // Pass 2a: exact kNN selection. One warp per query, k rounds of warp-wide lex-min reduction:
@@ -342,8 +366,9 @@ void estimate_covariances(GpuCloud& cloud, float leaf_size, int num_neighbors) {
   }
 
   {
-    const int grid = (num_points + COV_BLOCK - 1) / COV_BLOCK;
-    covariance_shell_kernel<<<grid, COV_BLOCK>>>(cloud.index.view(), cloud.points.raw(), cloud.keys.raw(), num_points, inv_leaf, num_neighbors, cloud.covs.raw(), counts.raw());
+    constexpr int WARP_BLOCK = COV_WARPS * 32;
+    const int grid = (num_points + COV_WARPS - 1) / COV_WARPS;
+    covariance_shell_kernel<<<grid, WARP_BLOCK>>>(cloud.index.view(), cloud.points.raw(), cloud.keys.raw(), num_points, inv_leaf, num_neighbors, cloud.covs.raw(), counts.raw());
     SGC_CHECK(cudaGetLastError());
   }
   // Exact brute-force completion only for small clouds: the O(N^2) warp-rounds cost is

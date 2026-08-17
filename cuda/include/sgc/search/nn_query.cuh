@@ -8,17 +8,21 @@
 namespace sgc {
 
 /// @brief Device-side single-query nearest neighbor over a voxel-bucket indexed cloud.
-///        Voxel3/Voxel5 probe the 3x3x3 / 5x5x5 voxel neighborhood via the O(1) hash index
-///        (approximate, but the true NN is almost always inside it for roughly aligned clouds);
-///        ExactBF scans all points.
-/// @param hidx      Voxel hash index view
-/// @param keys      Sorted unique voxel keys (fallback when the hash is not built)
-/// @param num_keys  Number of keys
-/// @param pts       Points (bucket centroids, same order as keys)
-/// @param q         Query point
-/// @param inv_leaf  1 / voxel size
-/// @param out_idx   [out] Found point index or -1
-/// @param out_d2    [out] Squared distance to the found point
+///        Voxel3/Voxel5 probe the 3x3x3 / 5x5x5 voxel neighborhood via the O(1) hash index.
+///        When the best hit is farther than `expand_d2` (or nothing is found), the probe
+///        expands once to a 9x9x9 neighborhood so that correspondences within the typical
+///        max_correspondence_distance (= 4 voxels) are still found, matching the kd-tree
+///        behavior on initially misaligned frames. ExactBF scans all points.
+/// @param hidx       Voxel hash index view
+/// @param keys       Sorted unique voxel keys (fallback when the hash is not built)
+/// @param num_keys   Number of keys
+/// @param pts        Points (bucket centroids, same order as keys)
+/// @param q          Query point
+/// @param inv_leaf   1 / voxel size
+/// @param expand_d2  Expansion threshold (squared); queries whose best is worse than this
+///                   probe the 9^3 neighborhood. Use 0.0f to disable.
+/// @param out_idx    [out] Found point index or -1
+/// @param out_d2     [out] Squared distance to the found point
 template <NNStrategy Strategy>
 __device__ __forceinline__ void nn_query(
   const HashIndexView& hidx,
@@ -27,6 +31,7 @@ __device__ __forceinline__ void nn_query(
   const float4* pts,
   float4 q,
   float inv_leaf,
+  float expand_d2,
   int* out_idx,
   float* out_d2) {
   if (Strategy == NNStrategy::ExactBF) {
@@ -77,6 +82,39 @@ __device__ __forceinline__ void nn_query(
         if (d2 < best_d2) {
           best_d2 = d2;
           best = j;
+        }
+      }
+    }
+  }
+
+  // Adaptive expansion for initially misaligned frames: the cheap window found nothing
+  // promising, so scan the window that covers the full correspondence rejection radius.
+  if (expand_d2 > 0.0f && (best < 0 || best_d2 > expand_d2)) {
+    const int R = 4;
+    for (int ox = -R; ox <= R; ox++) {
+      for (int oy = -R; oy <= R; oy++) {
+        for (int oz = -R; oz <= R; oz++) {
+          if (max(max(abs(ox), abs(oy)), abs(oz)) <= r) {
+            continue;  // already probed
+          }
+          const VoxelCoord coord{c.x + ox, c.y + oy, c.z + oz};
+          const unsigned long long key = coord_key(coord);
+          int j;
+          if (hidx.ready()) {
+            j = hash_lookup(hidx, key);
+          } else {
+            j = find_voxel(keys, num_keys, key);
+          }
+          if (j < 0) {
+            continue;
+          }
+          const float4 p = pts[j];
+          const float dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
+          const float d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 < best_d2) {
+            best_d2 = d2;
+            best = j;
+          }
         }
       }
     }
