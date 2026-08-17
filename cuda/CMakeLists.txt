@@ -36,3 +36,9 @@ if(BUILD_TESTS OR BUILD_CUDA)
     gtest_discover_tests(${TEST_NAME} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
 endif()
+
+##############
+## Benches ###
+##############
+add_executable(odometry_gpu bench/odometry_gpu.cpp)
+target_link_libraries(odometry_gpu PRIVATE sgc CUDA::cudart)

@@ -100,3 +100,12 @@
 - **调试方法论收获**：症状"矛盾"（e 有限但缓存 NaN）+ 非确定性 ⇒ 立即上 compute-sanitizer，比继续打补丁快一个量级。inv3 加了行列式下限保护（防御 NaN 输入）。
 - 数据集状态（用户询问）：KITTI 00 尚未下载（T11 执行）；本地 object3d 约 6GB 为会话前已有。
 - 测试：20/20，sanitizer 0 错误。
+
+## 2026-08-17 · T10 完成：odometry_gpu 对比 harness
+
+- CLI：`--exec full-gpu|hybrid|cpu` × `--engine gicp|vgicp` × `--nn voxel3|voxel5|exact-bf` + 参数 + `--traj/--report`；KITTI 目录模式 + `--synth` 合成漂移序列模式；计时口径=upstream（降采样+预处理+配准，I/O 在外）。
+- **合成序列验收层 1 通过**：两引擎 100% 帧在 1cm/0.3° 内（GICP max 0.00cm / VGICP max 0.03cm，vs upstream 串行 double）。
+- 稀疏 ply（6k 点）：cpu 11.4ms vs full-gpu 4.6ms（2.5×；9950X 单线程太强，Orin 上差距将拉大）。
+- 稠密 KITTI 帧（无关场景最坏情况，满 20 迭代）：**GICP 17×**（191.6→11.3ms p50）、**VGICP 10×**（67.2→6.8ms p50）。
+- hybrid 在 x86 上比 cpu 慢（CPU kdtree+covs 与 GPU covs 双算）——符合预期，Orin 上才有意义；已在代码注释说明。
+- 首帧 CUDA 上下文预热 ~130ms，报告看 p50/min。
