@@ -23,6 +23,35 @@ Acceptance gate (APE/RPE within 5% of upstream): **PASS for both engines**. Data
 directly from the official `avg-kitti` S3 zip (`scripts/fetch_kitti00_range.py`); the Google Drive
 subset referenced by upstream BENCHMARK.md is dead (404).
 
+### Full sequence 00 (all 4541 frames, official S3 data + GT poses)
+
+The complete 3.7 km loop, chained frame-to-frame odometry, no loop closure — the long-horizon
+stress test for both accuracy parity and latency stability.
+
+| engine | exec | p50 [msec/frame] | mean | p95 | fps | speedup (p50) | GPU vs CPU |
+|---|---|---|---|---|---|---|---|
+| GICP  | cpu (upstream) | 45.20 | 46.38 | 60.92 | 21.6 | 1.0x | reference |
+| GICP  | full-gpu       | **6.00** | 6.17 | 7.67 | 162 | **7.5x** | APE +0.22%, RPE(100) +0.003% |
+| VGICP | cpu (upstream) | 35.46 | 36.97 | 50.10 | 27.1 | 1.0x | reference |
+| VGICP | full-gpu       | **5.74** | 5.89 | 7.25 | 170 | **6.2x** | APE +1.45%, RPE(100) +0.91% |
+
+Gate (within 5%): **PASS for both engines**. Direct GPU-vs-CPU trajectory comparison over the full
+run: GICP APE 1.90 m (max 6.6 m) and RPE(100) 0.034 m on a trajectory whose accumulated drift is
+~380 m against GT — i.e. the two implementations stay glued together while both drift equally from
+GT (chained pairwise registration without loop closure diverges on a 3.7 km route; identical
+behavior upstream and here, RPE(400)_rot 2.91 vs 2.91 deg/km).
+
+Full-sequence extras:
+
+- Determinism: 5 reruns of the full sequence produce **bit-identical trajectory files**
+  (md5 equal across all 5), mean frame time 6.17 ms in every run.
+- Resources (1 Hz sampling over a full run): GPU memory steady **358 MiB** (independent of frame
+  index — the voxel map LRU bounds it), utilization mean 86% / p95 93%.
+- cuPCL on the full sequence (same protocol as below): p50 8.85 / mean 10.17 msec/frame —
+  ours p50 6.00 / mean 6.17, **1.5-1.65x faster** sustained over 4541 frames.
+- NN strategy on the full sequence (GICP p50): voxel3 5.96, voxel5 (default) 6.00, exact-bf 13.11
+  msec/frame — same ordering and ratios as the 100-frame ablation.
+
 ### Jetson Orin NX (target device, MAXN mode, CUDA 12.2, on-device build sm_87)
 
 Same 100-frame official KITTI-00 protocol, on-device build, 20/20 parity tests passing on the
@@ -137,6 +166,10 @@ far weaker — the GPU advantage holds against upstream's best CPU configuration
 cmake -B build_cuda -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build_cuda -j
 ctest --test-dir build_cuda           # 20 kernel-parity tests
 ./build_cuda/cuda/odometry_gpu <velodyne_dir> --exec full-gpu --engine gicp
+./build_cuda/cuda/odometry_gpu <velodyne_dir> --exec full-gpu --engine gicp --max_frames 4541 --traj /tmp/gpu.txt
+./build_cuda/cuda/odometry_gpu <velodyne_dir> --exec cpu --engine gicp --max_frames 4541 --traj /tmp/cpu.txt
+python3 scripts/eval_traj.py <kitti_gt_poses> /tmp/gpu.txt
+python3 scripts/eval_traj.py /tmp/cpu.txt /tmp/gpu.txt
 ./build_cuda/cuda/odometry_gpu --synth data/target.ply --exec cpu --traj /tmp/a.txt
 python3 scripts/eval_traj.py /tmp/a.txt /tmp/b.txt
 ```

@@ -15,9 +15,12 @@ fidelity to the CPU reference and single-frame latencies in the milliseconds.
 | Jetson Orin NX (MAXN) | GICP | 118.3 ms | **16.5 ms** | 7.2x | 1.2 cm over 100 frames |
 | Jetson Orin NX (MAXN) | VGICP | 102.3 ms | **14.2 ms** | 7.2x | 0.2 cm over 100 frames |
 
-KITTI odometry seq 00 (official data + GT), 100 frames, timing includes downsampling +
-covariance estimation + registration. Full methodology: [BENCHMARK_GPU.md](BENCHMARK_GPU.md)
-(includes a fair comparison against NVIDIA cuPCL's cuICP: 1.6x faster at matched inputs).
+Full KITTI-00 sequence (all 4541 frames, the complete 3.7 km loop): GICP 45.2 -> **6.0 ms**
+(7.5x, 162 fps), VGICP 35.5 -> **5.7 ms** (6.2x, 170 fps); trajectories stay within 0.22%/1.45%
+of upstream over the whole run, 5 reruns are bit-identical, GPU memory steady at 358 MiB.
+Timing includes downsampling + covariance estimation + registration. Full methodology:
+[BENCHMARK_GPU.md](BENCHMARK_GPU.md) (includes a fair comparison against NVIDIA cuPCL's cuICP:
+1.5-1.65x faster at matched inputs).
 
 Cross-architecture determinism: the GPU pipeline produces **bit-identical trajectories on
 sm_87 and sm_89** (APE = 0.0000 m across devices).

@@ -15,9 +15,11 @@ GICP（帧到帧）与 VGICP（帧到地图）的 GPU 原生重实现：与 CPU 
 | Jetson Orin NX（MAXN） | GICP | 118.3 ms | **16.5 ms** | 7.2× | 100 帧累计 1.2 cm |
 | Jetson Orin NX（MAXN） | VGICP | 102.3 ms | **14.2 ms** | 7.2× | 100 帧累计 0.2 cm |
 
-KITTI 里程计序列 00（官方数据 + 官方真值），100 帧；计时含降采样 + 协方差估计 + 配准
-全流程。完整方法论见 [BENCHMARK_GPU.md](BENCHMARK_GPU.md)（含与 NVIDIA cuPCL cuICP
-的公平对比：同等输入下快 1.6×）。
+KITTI-00 **全序列（4541 帧，完整 3.7 km 环路）**：GICP 45.2 → **6.0 ms**（7.5×，162 fps），
+VGICP 35.5 → **5.7 ms**（6.2×，170 fps）；整条轨迹与 upstream 相差 0.22%/1.45%，5 次重跑
+逐位一致，GPU 显存恒定 358 MiB。计时含降采样 + 协方差估计 + 配准全流程。完整方法论见
+[BENCHMARK_GPU.md](BENCHMARK_GPU.md)（含与 NVIDIA cuPCL cuICP 的公平对比：同等输入下
+快 1.5-1.65×）。
 
 跨架构确定性：GPU 管线在 **sm_87 与 sm_89 上输出逐位相同的轨迹**（跨设备 APE = 0.0000 m）。
 

@@ -178,3 +178,33 @@
 - **跨架构确定性实证**：Orin-GPU 与 x86-GPU 轨迹 APE=0.0000m（双引擎）——fp32+确定性归约设计在 sm_87/sm_89 间逐位复现。
 - 坑：rsync 软链数据未解引用导致设备端空云秒测（0.01ms 假结果）——重传 `-L` 实文件修复。
 - 定位变更（用户）：CUDA 专属库（独显+Jetson，无 CPU 回退）。README 重写为双语（README.md / README_zh.md），核心=与原版 small_gicp 的逐项区别表。仓库清理：删 6 个上游遗留分支（gh-pages/oct/paper/py/pybench/vox_vs_vox），留 cuda-x86(默认)/cuda-jetson/master(上游基线)。SSH 推送（github-functionhx 别名）解决 workflow scope；CI cuda-build 上线（sm_89+sm_87 双架构编译验证）。
+
+## 2026-08-18 — Full-sequence (4541 frames) validation
+
+Data engineering: seq-00 is stored contiguously inside the official 84.8 GB S3 zip
+(span [88, 8827720808) = 8.83 GB), so the whole sequence was range-fetched as 264 x 32 MB
+chunks over dual routes (direct + clash proxy, ~2-4 MB/s aggregate vs 0.65 MB/s single-route)
+and sliced locally via mmap. Two crash-time holes (412 frames) were detected by local-header
+scan, mapped to 66 chunks, re-fetched and re-sliced; final check = 4541/4541 files with
+byte-exact uncompressed sizes vs the zip central directory. Lesson: short-body responses on
+timeout can complete a "done" chunk with a zero hole — verify every frame header after a
+resumed transfer, not just chunk counters.
+
+Full-sequence results (whole 3.7 km loop, chained odometry, no loop closure):
+
+| engine | cpu p50/mean | gpu p50/mean | speedup | gate |
+|---|---|---|---|---|
+| GICP  | 45.20 / 46.38 ms | 6.00 / 6.17 ms | 7.5x (162 fps) | APE +0.22%, RPE100 +0.003% PASS |
+| VGICP | 35.46 / 36.97 ms | 5.74 / 5.89 ms | 6.2x (170 fps) | APE +1.45%, RPE100 +0.91% PASS |
+
+- GPU-vs-CPU direct parity over the full run: GICP APE 1.90 m (max 6.6 m), RPE(100) 0.034 m —
+  implementations stay glued while both drift ~380 m from GT (expected for chained pairwise
+  registration without loop closure; RPE(400)_rot 2.908 vs 2.907 deg/km).
+- Determinism: 5 full reruns -> identical trajectory md5.
+- Resources: GPU memory steady 358 MiB (LRU-bounded voxel map), util mean 86% / p95 93%.
+- cuPCL cuICP full sequence: p50 8.85 / mean 10.17 ms vs ours 6.00 / 6.17 -> 1.5-1.65x.
+- NN ablation full sequence (p50): voxel3 5.96 / voxel5 6.00 / exact-bf 13.11 ms — matches
+  the 100-frame ordering.
+
+Also learned: `set -e` + `cmd 2>/dev/null | grep -c pattern` aborts silently when the pattern
+lives on stderr and stdout is empty (killed the first finalize pass mid-script).
