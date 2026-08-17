@@ -33,7 +33,7 @@ if(BUILD_TESTS OR BUILD_CUDA)
       GTest::gtest_main
       small_gicp
     )
-    gtest_discover_tests(${TEST_NAME} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    gtest_discover_tests(${TEST_NAME} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR} DISCOVERY_MODE PRE_TEST)
   endforeach()
 endif()
 

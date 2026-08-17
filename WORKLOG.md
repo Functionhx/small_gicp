@@ -163,3 +163,10 @@
 - **公平对比**（同数据同链式策略，降采样计入计时）：cuPCL 最优配置=CPU降采样+cuICP **9.44ms**（APE 51.4m，trimmed point-to-plane）；其 cuFilter GPU 降采样在 0.25m 分辨率 ~275ms（参数与官方 demo 一致）反成瓶颈；**我们 6.01ms（1.6×）且与 upstream GICP 位姿 ≤0.01% 一致**。
 - 撤回先前"700×"说法（原始未降采样输入对 cuICP 是无效工况）——用户判断正确。
 - 结论入 BENCHMARK_GPU.md；bench 源码入库 cuda/bench/cupcl_bench.cpp。
+
+## 2026-08-18 · 代码侧收尾（用户确认维持 fork 分支形态）
+
+- CI：`.github/workflows/cuda-build.yml`——GPU-less runner 上的 sm_89 + sm_87 双架构编译验证；`gtest_discover_tests` 改 `DISCOVERY_MODE PRE_TEST`（无 GPU 环境构建不执行二进制）。
+- cupcl_bench 补 cuPCL 库获取与构建说明（不 vendor 其 .so，指路官方仓库）。
+- README 增加文档导览图。
+- 打 tag `v1.0.0-gpu`（论文工件引用锚点，可配 Zenodo DOI）。
