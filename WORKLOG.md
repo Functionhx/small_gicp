@@ -120,3 +120,14 @@
 5. 挂起：VGICP 残差 18cm/帧 疑来自大云（>8192）地图体素的 2.6% 部分协方差——KITTI 全序列 APE/RPE 相对指标裁决。
 
 **网络**：Google Drive 下载持续失败（代理 SSL/网络中断，重试循环挂后台）。object3d 相邻帧确认为同场景连续帧，先用其做真实序列基准。
+
+## 2026-08-18 · T11：真实序列基准 + 下载状态
+
+- 网络：换 7897 代理后连通，但 Google Drive 文件配额墙（"many accesses"），每 30 分钟重试中；**备选：用户浏览器直接下载**放 `~/datasets/kitti/odometry/KITTI00.tar.gz`。SemanticKITTI=80GB 过大、HF 无该子集镜像、Kaggle 需 key。
+- object3d 帧 0-59 验证为同场景连续序列，60 帧真实基准（p50 ms/帧）：
+  | 引擎 | CPU | GPU | 加速 | 60帧轨迹差 |
+  |---|---|---|---|---|
+  | GICP | 150.7 | 33.4 | 4.5× | APE 0.53m（~0.9cm/帧，门内） |
+  | VGICP | 78.4 | 8.9 | 8.8× | APE 1.80m（~3cm/帧，开放项） |
+- MAX_SHELL 12→16 试验：协方差 4.99→9.29ms，VGICP APE 不变（1.83）→ 深壳非瓶颈，已回退 12。VGICP 残差疑为 fp32 地图累积反馈放大，待全序列 APE/RPE 相对指标裁决。
+- GPU 吞吐：GICP 27.5 fps、VGICP 91.5 fps（4070，含最坏情况满迭代）。
