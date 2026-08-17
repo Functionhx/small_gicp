@@ -55,3 +55,10 @@
 - `nn_query.cuh`（device 模板，voxel3/voxel5 立方探查 + ExactBF 线性全扫）+ `nn_search.hpp/cu`（宿主批查 API）。
 - 一致率（data/target.ply @0.25m，60k 点，kd-tree 参考）：ExactBF 全等（same-index>99.9%）；Voxel3 <1% 不一致；Voxel5 <0.2%。
 - ExactBF 60k×60k 在 4070 上 ~0.1s——作为对照/验收路径完全可用。
+
+## 2026-08-17 · T6 完成：线性化 + 确定性归约
+
+- 融合内核（每源点一线程）：T·p → NN(策略) → M=(Ct+R·Cs·Rᵀ)⁻¹ → J=[R·skew(p)|−R] → H(上三角21项)/b/e + CorrCache（target_idx+M）。
+- 确定性归约：43 值 warp shuffle fp32 → lane0 fp64 定槽写 partial → CPU 按序 double 终和 → H 对称化。
+- 对拍（合成对，T 偏离最优 0.15m/0.5°）：ExactBF 全部 <0.1%；Voxel5 <0.5%；inlier 数一致；100 连跑逐位一致。
+- 调试记录：(1) T 在最优解时 ref_b≈0 导致相对误差虚高——测试改为偏置 T 使梯度有量级；(2) 内点计数曾只统计 lane 0 自身点（1/32 症状 0.0314），`__ballot_sync+__popc` 修复。

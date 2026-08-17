@@ -7,6 +7,7 @@ add_library(sgc STATIC
   src/voxel/downsample.cu
   src/preproc/covariance.cu
   src/search/nn.cu
+  src/reg/linearize.cu
 )
 target_include_directories(sgc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
