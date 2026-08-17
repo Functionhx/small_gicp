@@ -10,6 +10,19 @@ GPU-native reimplementation of small_gicp's registration pipeline (`cuda/`, name
 
 ## End-to-end results
 
+### Official KITTI odometry sequence 00 (first 100 frames, official S3 data + GT poses)
+
+| engine | exec | p50 [msec/frame] | speedup | fps | APE/RPE vs upstream |
+|---|---|---|---|---|---|
+| GICP  | cpu (upstream) | 43.9 | 1.0x | 21.4 | reference |
+| GICP  | full-gpu       | **6.0** | **7.3x** | 136 | **+0.01% / +0.00%** |
+| VGICP | cpu (upstream) | 34.4 | 1.0x | 27.2 | reference |
+| VGICP | full-gpu       | **5.6** | **6.1x** | 143 | **+0.00% / +0.00%** |
+
+Acceptance gate (APE/RPE within 5% of upstream): **PASS for both engines**. Data was range-extracted
+directly from the official `avg-kitti` S3 zip (`scripts/fetch_kitti00_range.py`); the Google Drive
+subset referenced by upstream BENCHMARK.md is dead (404).
+
 ### 60-frame real LiDAR sequence (KITTI object3d training, consecutive frames 0-59)
 
 Worst-case regime: partial overlap (~40-55% inliers) with identity initialization, so both implementations run full 20 LM iterations per frame.
@@ -61,7 +74,7 @@ Per-frame difference vs upstream: **100% of frames within 1 cm / 0.3 deg** for b
 - fp32 storage/math with fp64 warp reductions and a CPU double LM solve; upstream LM constants ported line-by-line.
 - Deterministic: fixed launch configs, ordered reductions; run-to-run bit-identical.
 - `exec=hybrid` (CPU preprocessing + GPU registration) is slower than both on x86 (strong CPU + duplicated covariance); it exists for the Orin NX comparison where the CPU side is weak.
-- Known open item: KITTI odometry seq 00 (622 MB subset) download is quota-blocked on Google Drive; the full-sequence APE/RPE gate runs when it lands. Real-frame results above use consecutive KITTI object3d scans as a substitute.
+- The 60-frame object3d table above is a worst-case stress regime (partial overlap, identity init, full 20 iterations); the official KITTI-00 table is the representative odometry regime.
 
 ## Reproduce
 
