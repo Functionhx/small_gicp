@@ -144,3 +144,8 @@
 - BENCHMARK_GPU.md：60 帧真实序列 GICP 9.2×/VGICP 8.7×、单帧精度表、内核级对拍、流水线分解、复现步骤。README 增加 GPU 构建节。
 - 待办（用户协助）：KITTI00.tar.gz（622MB）浏览器下载放 ~/datasets/kitti/odometry/ → 正式 APE/RPE 验收 → 若过再设 default 分支（用户原条件"验证完成后"）。
 - jetson 移植要点已写入设计文档 §11。
+
+## 2026-08-18 · T13 完成态
+
+- 最终验证：20/20 测试、合成验收 30/30=100%（1cm/0.3°）、审计通过（我方 13 提交作者/签名合规、零 Co-Authored-By；上游历史自带 5 处非我方）。
+- 已推送 origin/cuda-x86（335ed04）。default 分支切换按用户条件挂起（待 KITTI00 验收，任务 #7）。
