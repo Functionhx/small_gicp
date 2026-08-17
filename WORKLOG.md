@@ -32,3 +32,9 @@
 - `sgc::GpuCloud`：points(float4)/covs(9f)/keys(u64) 三缓冲 + 宿主互转助手。
 - io_test 2 用例通过（data/target.ply 69088 点，4 属性 stride=4）。
 - 坑位：file(GLOB) 配置期求值，新增源文件要重跑 cmake。
+
+## 2026-08-17 · T3 完成：GPU 降采样
+
+- `voxel_key.hpp`（fast_floor/21bit×3 打包/解包，host+device）+ `Downsampler`（keys → CUB radix sort → run flags → ExclusiveSum/CSR → 每桶一 block fp64 树归约质心）。
+- ParityWithUpstream 通过：桶数、key 升序、质心 1e-4 内与 upstream 一致（data/target.ply, 69088→N 点 @0.25m）。
+- 坑位：(1) 上游 voxelgrid_sampling 对 vector<Vector4f> 输出需显式 OutputPointCloud=small_gicp::PointCloud；(2) CUB 输出缓冲（reduce_out_）必须显式分配。

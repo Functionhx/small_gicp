@@ -4,6 +4,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(sgc STATIC
   src/core/buffer.cu
+  src/voxel/downsample.cu
 )
 target_include_directories(sgc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
