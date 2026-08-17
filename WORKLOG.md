@@ -156,3 +156,10 @@
 - **正式验收（KITTI-00 官方 100 帧）**：GICP APE/RPE 相对差 +0.01%/+0.00%、VGICP +0.00%/+0.00% —— **双引擎 PASS（门限 5%）**。速度：GICP 43.9→6.0ms（**7.3×**，136fps）、VGICP 34.4→5.6ms（**6.1×**，143fps）。
 - object3d 上 VGICP ~3cm/帧 残差确认为无关场景最坏情况的 fp32 放大；官方数据下四位小数一致，撤销该开放项。
 - 验收四层全过：合成 100%、KITTI ≤0.01%、内核 20/20、确定性逐位。执行用户指令：设 default 分支。
+
+## 2026-08-18 · cuPCL 对比（用户点题，诚实口径）
+
+- 用户指路 `NVIDIA-AI-IOT/cuPCL` 的 `x86_64_lib` 分支（x86 预编译 .so，sm_86 cubin 经 CUDA 小版本二进制兼容在 sm_89 实测可跑）。
+- **公平对比**（同数据同链式策略，降采样计入计时）：cuPCL 最优配置=CPU降采样+cuICP **9.44ms**（APE 51.4m，trimmed point-to-plane）；其 cuFilter GPU 降采样在 0.25m 分辨率 ~275ms（参数与官方 demo 一致）反成瓶颈；**我们 6.01ms（1.6×）且与 upstream GICP 位姿 ≤0.01% 一致**。
+- 撤回先前"700×"说法（原始未降采样输入对 cuICP 是无效工况）——用户判断正确。
+- 结论入 BENCHMARK_GPU.md；bench 源码入库 cuda/bench/cupcl_bench.cpp。

@@ -58,6 +58,30 @@ Per-frame difference vs upstream: **100% of frames within 1 cm / 0.3 deg** for b
 - Voxel map: per-voxel mean/cov/count parity with upstream `GaussianVoxelMap`; deterministic across runs.
 - `compute-sanitizer memcheck`: 0 errors.
 
+## Comparison with NVIDIA cuPCL (cuICP)
+
+Same machine, same KITTI-00 frames, same odometry loop policy; cuPCL from the
+`NVIDIA-AI-IOT/cuPCL` repo (`x86_64_lib` branch, prebuilt sm_86 binaries run on sm_89 via
+CUDA minor-version binary compatibility). Bench source: `cuda/bench/cupcl_bench.cpp`.
+All rows include downsampling to 0.25 m inside the timed section (identical input policy).
+
+| pipeline | algorithm | p50 [msec/frame] | APE vs GT (100f) |
+|---|---|---|---|
+| cuPCL: CPU downsample + cuICP | trimmed point-to-plane ICP | 9.44 | 51.4 m |
+| cuPCL: cuFilter GPU downsample + cuICP | same | 275.2 | 58.2 m |
+| upstream CPU (reference) | GICP | 43.9 | 64.6 m |
+| **sgc (ours), full-GPU** | **GICP (bit-parity with upstream)** | **6.01** | **64.6 m** |
+
+Notes (kept honest):
+- cuPCL offers no GICP/VGICP (distribution-to-distribution) equivalent; its APE differs because
+  it is a different algorithm, not a worse implementation of the same one.
+- cuFilter at 0.25 m voxel resolution costs ~270 msec/frame on 120k-point frames
+  (parameters identical to their demo; voxel=1.0 demo numbers are faster but not comparable),
+  which makes their all-GPU path slower than their CPU-preprocessing path here.
+- The practical comparison is therefore **ours 6.01 ms vs cuPCL best config 9.44 ms (1.6x)**,
+  with ours additionally reproducing upstream GICP/VGICP results to <=0.01%.
+- Feeding cuICP raw (undownsampled) 120k-point frames is not a meaningful benchmark (~4.2 s/frame).
+
 ## Pipeline breakdown (RTX 4070, 120k-pt frame -> ~35k voxels)
 
 | stage | time |
