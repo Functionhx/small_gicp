@@ -35,6 +35,9 @@
 
 #include <small_gicp/ann/gaussian_voxelmap.hpp>
 #include <small_gicp/ann/kdtree.hpp>
+#include <small_gicp/ann/kdtree_omp.hpp>
+#include <small_gicp/registration/reduction_omp.hpp>
+#include <small_gicp/util/normal_estimation_omp.hpp>
 #include <small_gicp/factors/gicp_factor.hpp>
 #include <small_gicp/points/eigen.hpp>
 #include <small_gicp/points/point_cloud.hpp>
@@ -108,6 +111,59 @@ struct CpuVgicpOdometry {
   }
 
   Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+};
+
+// ---------------------------------------------------------------- upstream CPU engines (OpenMP)
+
+struct CpuOmpGicpOdometry {
+  small_gicp::PointCloud::Ptr target;
+  std::shared_ptr<small_gicp::KdTree<small_gicp::PointCloud>> target_tree;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    auto down = small_gicp::voxelgrid_sampling<std::vector<Eigen::Vector4f>, small_gicp::PointCloud>(frame, p.downsampling_resolution);
+    auto tree = std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(down, small_gicp::KdTreeBuilderOMP(p.num_threads));
+    small_gicp::estimate_covariances_omp(*down, *tree, p.num_neighbors, p.num_threads);
+
+    if (target == nullptr) {
+      target = down;
+      target_tree = tree;
+      return T_world;
+    }
+
+    small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
+    reg.rejector.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
+    reg.reduction.num_threads = p.num_threads;
+    const auto result = reg.align(*target, *down, *target_tree, Eigen::Isometry3d::Identity());
+
+    T_world = T_world * result.T_target_source;
+    target = down;
+    target_tree = tree;
+    return T_world;
+  }
+};
+
+struct CpuOmpVgicpOdometry {
+  std::shared_ptr<small_gicp::GaussianVoxelMap> voxelmap;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    auto down = small_gicp::voxelgrid_sampling<std::vector<Eigen::Vector4f>, small_gicp::PointCloud>(frame, p.downsampling_resolution);
+    small_gicp::estimate_covariances_omp(*down, p.num_neighbors, p.num_threads);
+
+    if (voxelmap == nullptr) {
+      voxelmap = std::make_shared<small_gicp::GaussianVoxelMap>(p.voxel_resolution);
+      voxelmap->insert(*down);
+      return Eigen::Isometry3d::Identity();
+    }
+
+    small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
+    reg.reduction.num_threads = p.num_threads;
+    const auto result = reg.align(*voxelmap, *down, *voxelmap, T_world);
+    T_world = result.T_target_source;
+    voxelmap->insert(*down, T_world);
+    return T_world;
+  }
 };
 
 // ---------------------------------------------------------------- GPU engines
@@ -275,6 +331,8 @@ int main(int argc, char** argv) {
 
   CpuGicpOdometry cpu_gicp;
   CpuVgicpOdometry cpu_vgicp;
+  CpuOmpGicpOdometry cpu_omp_gicp;
+  CpuOmpVgicpOdometry cpu_omp_vgicp;
   GpuGicpOdometry gpu_gicp;
   GpuVgicpOdometry gpu_vgicp;
   HybridGicpOdometry hybrid_gicp;
@@ -286,6 +344,8 @@ int main(int argc, char** argv) {
 
     if (p.exec == "cpu") {
       T = p.engine == "vgicp" ? cpu_vgicp.estimate(frame, p) : cpu_gicp.estimate(frame, p);
+    } else if (p.exec == "cpu-omp") {
+      T = p.engine == "vgicp" ? cpu_omp_vgicp.estimate(frame, p) : cpu_omp_gicp.estimate(frame, p);
     } else if (p.exec == "hybrid") {
       T = hybrid_gicp.estimate(frame, p);
     } else {
