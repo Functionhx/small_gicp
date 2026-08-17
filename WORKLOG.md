@@ -86,3 +86,9 @@
 **遗留（T12）**：深层壳尾部延迟用 warp 协作探查根治；kernel launch 间隙用 CUDA Graph。
 
 **测试**：17/17（含 eval_error 自洽性检查、逐位确定性、ExactBF/Voxel5 线性化对拍、双引擎 align 对拍）。
+
+## 2026-08-17 · T8 完成：VoxelHashMap + LRU
+
+- `VoxelHashMap`：开放寻址（slot=表位）、排序 run 串行累加 + 每体素每帧一次原子（跨帧确定性）、finalize 写独立 mean/cov、LRU horizon/cycle 移植、倍增 grow 全载荷迁移。
+- Parity：与 upstream GaussianVoxelMap 双帧插入对拍——体素数一致、mean<1e-3、cov<2e-2（fp32 原子和 vs double）；确定性测试逐位通过。
+- **调试教训（1.5h 排查）**：对拍失败根因是测试 dump 函数 `download(..., cap)` 少乘 9（只填前 1/9，槽位靠后的体素全零）。GPU 实现自始正确。排查路径：sum_cov 直读→finalize 直读→槽位 TRACE→同一循环双路对质→定位 dump 笔误。过程中顺手修掉两个真 bug：槽累加数组未清零（依赖 cudaMalloc 零页）、grow() 丢载荷。

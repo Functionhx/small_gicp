@@ -6,6 +6,7 @@ add_library(sgc STATIC
   src/core/buffer.cu
   src/voxel/downsample.cu
   src/voxel/hash_index.cu
+  src/voxel/voxel_hash_map.cu
   src/preproc/covariance.cu
   src/search/nn.cu
   src/reg/linearize.cu
