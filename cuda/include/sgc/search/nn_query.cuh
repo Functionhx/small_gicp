@@ -32,6 +32,7 @@ __device__ __forceinline__ void nn_query(
   float4 q,
   float inv_leaf,
   float expand_d2,
+  float search_cap_d2,
   int* out_idx,
   float* out_d2) {
   if (Strategy == NNStrategy::ExactBF) {
@@ -88,14 +89,29 @@ __device__ __forceinline__ void nn_query(
   }
 
   // Adaptive expansion for initially misaligned frames: the cheap window found nothing
-  // promising, so scan the window that covers the full correspondence rejection radius.
+  // promising, so probe the window that covers the correspondence rejection radius. Voxels
+  // whose closest possible point is farther than the current best are pruned, which reduces
+  // the effective scan to the sphere shell around the query.
   if (expand_d2 > 0.0f && (best < 0 || best_d2 > expand_d2)) {
     const int R = 4;
+    // Query position inside its own voxel, in [0, 1)
+    const float fx = q.x * inv_leaf - floorf(q.x * inv_leaf);
+    const float fy = q.y * inv_leaf - floorf(q.y * inv_leaf);
+    const float fz = q.z * inv_leaf - floorf(q.z * inv_leaf);
     for (int ox = -R; ox <= R; ox++) {
+      const float gx = ox == 0 ? 0.0f : (abs(ox) - 1 + (ox > 0 ? 1.0f - fx : fx));
       for (int oy = -R; oy <= R; oy++) {
+        const float gy = oy == 0 ? 0.0f : (abs(oy) - 1 + (oy > 0 ? 1.0f - fy : fy));
         for (int oz = -R; oz <= R; oz++) {
           if (max(max(abs(ox), abs(oy)), abs(oz)) <= r) {
             continue;  // already probed
+          }
+          const float gz = oz == 0 ? 0.0f : (abs(oz) - 1 + (oz > 0 ? 1.0f - fz : fz));
+          // Voxel-unit distance to the closest point of this voxel; prune when it cannot beat
+          // the current best or can never come under the correspondence rejection radius.
+          const float prune_ref = best >= 0 ? best_d2 : search_cap_d2;
+          if ((gx * gx + gy * gy + gz * gz) / (inv_leaf * inv_leaf) >= prune_ref) {
+            continue;
           }
           const VoxelCoord coord{c.x + ox, c.y + oy, c.z + oz};
           const unsigned long long key = coord_key(coord);

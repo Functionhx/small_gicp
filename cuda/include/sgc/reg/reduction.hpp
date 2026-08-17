@@ -58,6 +58,8 @@ private:
   GpuBuffer<float> d_T_;                   ///< 16 floats, row-major 4x4
   GpuBuffer<double> partials_;             ///< num_warps * 43
   GpuBuffer<unsigned int> inlier_count_;
+  GpuBuffer<int> nn_j_;                    ///< Warp-cooperative NN results (indices)
+  GpuBuffer<float> nn_d2_;                 ///< Warp-cooperative NN results (squared distances)
   GpuBuffer<double> error_out_;
   size_t num_warps_ = 0;
   int block_ = 256;

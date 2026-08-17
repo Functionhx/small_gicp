@@ -15,11 +15,153 @@ namespace {
 constexpr int BLOCK = 256;
 constexpr int NUM_OUT = 43;  // H(36) + b(6) + e(1)
 
+
+// Warp-cooperative batch NN: one warp per source query. Phase 1 probes the 5^3 window with a
+// warp reduction; phase 2 (only when the best is worse than the expansion threshold) probes
+// the pruned 9^3 sphere. Deterministic: warp-min over (dist, index) pairs.
+__global__ void nn_batch_kernel(
+  HashIndexView hidx,
+  const unsigned long long* keys,
+  int num_keys,
+  const float4* pts,
+  const float4* queries,
+  int num_queries,
+  const float* T,  // row-major 4x4
+  float inv_leaf,
+  float max_dist_sq,
+  int* out_idx,
+  float* out_d2) {
+  const int lane = threadIdx.x & 31;
+  const int query = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  if (query >= num_queries) {
+    return;
+  }
+
+  // Search at the transformed position q = T * p (same as the per-thread path)
+  const float4 ps = queries[query];
+  const float4* T4 = reinterpret_cast<const float4*>(T);
+  const float4 r0 = T4[0], r1 = T4[1], r2 = T4[2];
+  const float4 q = make_float4(
+    r0.x * ps.x + r0.y * ps.y + r0.z * ps.z + r0.w, r1.x * ps.x + r1.y * ps.y + r1.z * ps.z + r1.w, r2.x * ps.x + r2.y * ps.y + r2.z * ps.z + r2.w, 1.0f);
+  const unsigned long long qkey = voxel_key(q, inv_leaf);
+  if (qkey == INVALID_KEY) {
+    if (lane == 0) {
+      out_idx[query] = -1;
+      out_d2[query] = 0.0f;
+    }
+    return;
+  }
+  const VoxelCoord c = key_coord(qkey);
+
+  float best_d2 = 3.4e38f;
+  int best = -1;
+
+  // Phase 1: 5x5x5 window, lanes stride
+  {
+    const int r = 2;
+    const int n3 = 125;
+    float my_d2 = 3.4e38f;
+    int my_j = -1;
+    for (int t = lane; t < n3; t += 32) {
+      const int ox = t / 25 - r;
+      const int rem = t % 25;
+      const int oy = rem / 5 - r;
+      const int oz = rem % 5 - r;
+      const VoxelCoord coord{c.x + ox, c.y + oy, c.z + oz};
+      const int j = hidx.ready() ? hash_lookup(hidx, coord_key(coord)) : find_voxel(keys, num_keys, coord_key(coord));
+      if (j >= 0) {
+        const float4 p = pts[j];
+        const float dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < my_d2) {
+          my_d2 = d2;
+          my_j = j;
+        }
+      }
+    }
+    // Warp min reduction over (d2, j)
+    for (int off = 16; off > 0; off >>= 1) {
+      const float od2 = __shfl_down_sync(0xffffffffu, my_d2, off);
+      const int oj = __shfl_down_sync(0xffffffffu, my_j, off);
+      if (od2 < my_d2) {
+        my_d2 = od2;
+        my_j = oj;
+      }
+    }
+    best_d2 = __shfl_sync(0xffffffffu, my_d2, 0);
+    best = __shfl_sync(0xffffffffu, my_j, 0);
+  }
+
+  // Phase 2: pruned 9^3 sphere when the window was not promising. Pruning against the
+  // (stale, larger) phase-1 best is conservative: skipped voxels cannot beat the final best.
+  const float expand_d2 = 4.0f / (inv_leaf * inv_leaf);
+  if (best < 0 || best_d2 > expand_d2) {
+    const float fx = q.x * inv_leaf - floorf(q.x * inv_leaf);
+    const float fy = q.y * inv_leaf - floorf(q.y * inv_leaf);
+    const float fz = q.z * inv_leaf - floorf(q.z * inv_leaf);
+    const float prune_ref = best >= 0 ? best_d2 : max_dist_sq;
+    const float leaf = 1.0f / inv_leaf;
+
+    float my_d2 = 3.4e38f;
+    int my_j = -1;
+    const int R = 4;
+    const int W = 2 * R + 1;
+    const int n3 = W * W * W;
+    for (int t = lane; t < n3; t += 32) {
+      const int ox = t / (W * W) - R;
+      const int rem = t % (W * W);
+      const int oy = rem / W - R;
+      const int oz = rem % W - R;
+      if (max(max(abs(ox), abs(oy)), abs(oz)) <= 2) {
+        continue;  // phase 1 already covered the 5^3 window
+      }
+      const float gx = ox == 0 ? 0.0f : (abs(ox) - 1 + (ox > 0 ? 1.0f - fx : fx));
+      const float gy = oy == 0 ? 0.0f : (abs(oy) - 1 + (oy > 0 ? 1.0f - fy : fy));
+      const float gz = oz == 0 ? 0.0f : (abs(oz) - 1 + (oz > 0 ? 1.0f - fz : fz));
+      if ((gx * gx + gy * gy + gz * gz) * (leaf * leaf) >= prune_ref) {
+        continue;
+      }
+      const VoxelCoord coord{c.x + ox, c.y + oy, c.z + oz};
+      const int j = hidx.ready() ? hash_lookup(hidx, coord_key(coord)) : find_voxel(keys, num_keys, coord_key(coord));
+      if (j >= 0) {
+        const float4 p = pts[j];
+        const float dx = q.x - p.x, dy = q.y - p.y, dz = q.z - p.z;
+        const float d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < my_d2) {
+          my_d2 = d2;
+          my_j = j;
+        }
+      }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+      const float od2 = __shfl_down_sync(0xffffffffu, my_d2, off);
+      const int oj = __shfl_down_sync(0xffffffffu, my_j, off);
+      if (od2 < my_d2) {
+        my_d2 = od2;
+        my_j = oj;
+      }
+    }
+    const float p2_d2 = __shfl_sync(0xffffffffu, my_d2, 0);
+    const int p2_j = __shfl_sync(0xffffffffu, my_j, 0);
+    if (p2_j >= 0 && p2_d2 < best_d2) {
+      best_d2 = p2_d2;
+      best = p2_j;
+    }
+  }
+
+  if (lane == 0) {
+    out_idx[query] = best;
+    out_d2[query] = best_d2;
+  }
+}
+
 // Fused per-point GICP linearization: transform -> NN -> mahalanobis -> H, b, e per point,
 // then a deterministic warp shuffle reduction (fp32) with fp64 partials at lane 0.
 template <NNStrategy Strategy, bool ErrorOnly>
 __global__ void linearize_kernel(
   HashIndexView hidx,
+  const int* pre_j,
+  const float* pre_d2,
   const float4* target_pts,
   const unsigned long long* target_keys,
   const float* target_covs,
@@ -71,7 +213,12 @@ __global__ void linearize_kernel(
       }
     } else {
       float d2 = 0.0f;
-      nn_query<Strategy>(hidx, target_keys, num_target, target_pts, make_float4(q.x, q.y, q.z, 1.0f), inv_leaf, 4.0f / (inv_leaf * inv_leaf), &j, &d2);
+      if (pre_j != nullptr) {
+        j = pre_j[i];
+        d2 = pre_d2[i];
+      } else {
+        nn_query<Strategy>(hidx, target_keys, num_target, target_pts, make_float4(q.x, q.y, q.z, 1.0f), inv_leaf, 4.0f / (inv_leaf * inv_leaf), max_dist_sq, &j, &d2);
+      }
 
       if (j >= 0 && d2 <= max_dist_sq) {
         // M = (Ct + R * Cs * R^T)^-1
@@ -200,6 +347,10 @@ void Linearizer::prepare(size_t num_source) {
   if (inlier_count_.size() != 1) {
     inlier_count_.resize(1);
   }
+  if (nn_j_.size() != static_cast<size_t>(num_source)) {
+    nn_j_.resize(num_source);
+    nn_d2_.resize(num_source);
+  }
 }
 
 namespace {
@@ -246,20 +397,33 @@ size_t Linearizer::linearize_and_reduce(
   const float inv_leaf = 1.0f / leaf_size;
   const HashIndexView hidx = target.index.view();
 
+  const int* pre_j = nullptr;
+  const float* pre_d2 = nullptr;
+  if (nn == NNStrategy::Voxel3 || nn == NNStrategy::Voxel5) {
+    // Warp-cooperative NN pass: one warp per query with pruned sphere expansion
+    constexpr int NN_BLOCK = 256;
+    const int nn_grid = (num_source + 7) / 8;
+    nn_batch_kernel<<<nn_grid, NN_BLOCK>>>(
+      hidx, target.keys.raw(), num_target, target.points.raw(), source.points.raw(), num_source, d_T_.raw(), inv_leaf, max_dist_sq, nn_j_.raw(), nn_d2_.raw());
+    SGC_CHECK(cudaGetLastError());
+    pre_j = nn_j_.raw();
+    pre_d2 = nn_d2_.raw();
+  }
+
   switch (nn) {
     case NNStrategy::Voxel3:
       linearize_kernel<NNStrategy::Voxel3, false><<<grid, block_>>>(
-        hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
+        hidx, pre_j, pre_d2, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
         inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
       break;
     case NNStrategy::Voxel5:
       linearize_kernel<NNStrategy::Voxel5, false><<<grid, block_>>>(
-        hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
+        hidx, pre_j, pre_d2, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
         inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
       break;
     case NNStrategy::ExactBF:
       linearize_kernel<NNStrategy::ExactBF, false><<<grid, block_>>>(
-        hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
+        hidx, nullptr, nullptr, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
         inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
       break;
   }
@@ -300,7 +464,7 @@ double Linearizer::eval_error_cached(const GpuCloud& target, const GpuCloud& sou
   const int grid = (num_source + block_ - 1) / block_;
   const HashIndexView hidx = target.index.view();
   linearize_kernel<NNStrategy::Voxel3, true><<<grid, block_>>>(
-    hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, 0, d_T_.raw(), 0.0f, 0.0f, partials_.raw(),
+    hidx, nullptr, nullptr, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, 0, d_T_.raw(), 0.0f, 0.0f, partials_.raw(),
     inlier_count_.raw(), const_cast<int*>(cache.target_idx.raw()), const_cast<float*>(cache.mahalanobis.raw()));
   SGC_CHECK(cudaGetLastError());
 
