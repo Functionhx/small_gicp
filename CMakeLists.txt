@@ -259,6 +259,23 @@ if(BUILD_EXAMPLES)
   endforeach()
 endif()
 
+#############
+## CUDA #####
+#############
+option(BUILD_CUDA "Build CUDA accelerated implementation (sgc)" OFF)
+if(BUILD_CUDA)
+  if(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+  endif()
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  # The sgc tests and benchmarks link the upstream helper library as the accuracy reference
+  set(BUILD_HELPER ON CACHE BOOL "Helper library is required" FORCE)
+  enable_testing()
+  add_subdirectory(cuda)
+endif()
+
 ##########
 ## Test ##
 ##########

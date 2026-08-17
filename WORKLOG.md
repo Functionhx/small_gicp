@@ -17,3 +17,11 @@
 **下一步**：M0 脚手架（CMake CUDA + GTest + KITTI/bin+ply 读取 + 空 harness）。
 
 **挂起决策**：无。
+
+## 2026-08-17 · T1 完成：CUDA 脚手架
+
+- 顶层 `BUILD_CUDA` 门控 + `cuda/` 子项目；`sgc` 静态库（cudart 公共链接）。
+- `sgc::GpuBuffer<T>`（RAII/移动/上传下载）+ `SGC_CHECK` + `launch_fill_kernel`。
+- smoke_test 2 用例通过；无 CUDA 默认配置不受影响。
+- 坑位记录：(1) worktree 内构建源路径是 `..` 而非 `../..`；(2) `enable_testing()` 必须在顶层调用；(3) .cpp 测试链 CUDA 头需 `CUDA::cudart`；(4) `<<<>>>` 只能在 .cu，host 包装命名 `launch_*`。
+- 决策：执行方式为会话内联（GPU 编译-运行-调试循环紧）。
