@@ -8,6 +8,7 @@
 #include <Eigen/Core>
 
 #include <sgc/core/buffer.hpp>
+#include <sgc/voxel/hash_index.hpp>
 
 namespace sgc {
 
@@ -16,6 +17,7 @@ struct GpuCloud {
   GpuBuffer<float4> points;               ///< Points (centroids after downsampling, sorted by voxel key)
   GpuBuffer<float> covs;                  ///< Per-point 3x3 covariances, row-major, 9 floats per point
   GpuBuffer<unsigned long long> keys;     ///< Unique sorted voxel keys (one per point, same order)
+  VoxelHashIndex index;                   ///< O(1) voxel hash index over keys (built by Downsampler)
 
   /// @brief Number of indexed points (valid after downsampling).
   size_t size() const { return keys.size(); }

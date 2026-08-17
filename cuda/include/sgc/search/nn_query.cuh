@@ -2,14 +2,17 @@
 #pragma once
 
 #include <sgc/search/nn.hpp>
+#include <sgc/voxel/hash_index.cuh>
 #include <sgc/voxel/voxel_key.hpp>
 
 namespace sgc {
 
 /// @brief Device-side single-query nearest neighbor over a voxel-bucket indexed cloud.
-///        Voxel3/Voxel5 probe the 3x3x3 / 5x5x5 voxel neighborhood (approximate, but the true
-///        NN is almost always inside it for roughly aligned clouds); ExactBF scans all points.
-/// @param keys      Sorted unique voxel keys
+///        Voxel3/Voxel5 probe the 3x3x3 / 5x5x5 voxel neighborhood via the O(1) hash index
+///        (approximate, but the true NN is almost always inside it for roughly aligned clouds);
+///        ExactBF scans all points.
+/// @param hidx      Voxel hash index view
+/// @param keys      Sorted unique voxel keys (fallback when the hash is not built)
 /// @param num_keys  Number of keys
 /// @param pts       Points (bucket centroids, same order as keys)
 /// @param q         Query point
@@ -18,6 +21,7 @@ namespace sgc {
 /// @param out_d2    [out] Squared distance to the found point
 template <NNStrategy Strategy>
 __device__ __forceinline__ void nn_query(
+  const HashIndexView& hidx,
   const unsigned long long* keys,
   int num_keys,
   const float4* pts,
@@ -57,7 +61,13 @@ __device__ __forceinline__ void nn_query(
     for (int oy = -r; oy <= r; oy++) {
       for (int oz = -r; oz <= r; oz++) {
         const VoxelCoord coord{c.x + ox, c.y + oy, c.z + oz};
-        const int j = find_voxel(keys, num_keys, coord_key(coord));
+        const unsigned long long key = coord_key(coord);
+        int j;
+        if (hidx.ready()) {
+          j = hash_lookup(hidx, key);
+        } else {
+          j = find_voxel(keys, num_keys, key);
+        }
         if (j < 0) {
           continue;
         }

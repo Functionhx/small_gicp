@@ -190,6 +190,7 @@ void Downsampler::run(GpuCloud& cloud, size_t num_raw, double leaf_size) {
   cloud.keys = std::move(out_keys_);
   out_points_ = GpuBuffer<float4>();
   out_keys_ = GpuBuffer<unsigned long long>();
+  cloud.index.build(cloud.keys.raw(), num_buckets);
 }
 
 }  // namespace sgc

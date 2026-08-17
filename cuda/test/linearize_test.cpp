@@ -113,6 +113,10 @@ protected:
     EXPECT_LT((b - ref_b).norm() / ref_b.norm(), b_tol);
     EXPECT_LT(std::abs(e - ref_e) / std::abs(ref_e), e_tol);
     EXPECT_NEAR(static_cast<double>(inliers) / ref_inliers, 1.0, inlier_tol);
+
+    // Self-consistency: the cached-correspondence error at the same T must equal the linearized e
+    const double e_cached = linearizer.eval_error_cached(gpu_target, gpu_source, T, cache);
+    EXPECT_LT(std::abs(e_cached - e) / std::abs(e), 1e-6);
   }
 
   std::vector<Eigen::Vector4f> raw;

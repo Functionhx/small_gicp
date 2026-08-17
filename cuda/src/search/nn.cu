@@ -12,6 +12,7 @@ constexpr int BLOCK = 256;
 
 template <NNStrategy Strategy>
 __global__ void nn_kernel(
+  HashIndexView hidx,
   const unsigned long long* keys,
   int num_keys,
   const float4* pts,
@@ -24,7 +25,7 @@ __global__ void nn_kernel(
   if (i >= num_queries) {
     return;
   }
-  nn_query<Strategy>(keys, num_keys, pts, queries[i], inv_leaf, out_idx + i, out_d2 + i);
+  nn_query<Strategy>(hidx, keys, num_keys, pts, queries[i], inv_leaf, out_idx + i, out_d2 + i);
 }
 
 }  // namespace
@@ -36,6 +37,7 @@ void nn_search(const GpuCloud& target, const GpuBuffer<float4>& queries, GpuBuff
     return;
   }
 
+  const HashIndexView hidx = target.index.view();
   const int num_keys = static_cast<int>(target.size());
   const int num_queries = static_cast<int>(queries.size());
   const int grid = (num_queries + BLOCK - 1) / BLOCK;
@@ -43,13 +45,13 @@ void nn_search(const GpuCloud& target, const GpuBuffer<float4>& queries, GpuBuff
 
   switch (strategy) {
     case NNStrategy::Voxel3:
-      nn_kernel<NNStrategy::Voxel3><<<grid, BLOCK>>>(target.keys.raw(), num_keys, target.points.raw(), queries.raw(), num_queries, inv_leaf, out_idx.raw(), out_d2.raw());
+      nn_kernel<NNStrategy::Voxel3><<<grid, BLOCK>>>(hidx, target.keys.raw(), num_keys, target.points.raw(), queries.raw(), num_queries, inv_leaf, out_idx.raw(), out_d2.raw());
       break;
     case NNStrategy::Voxel5:
-      nn_kernel<NNStrategy::Voxel5><<<grid, BLOCK>>>(target.keys.raw(), num_keys, target.points.raw(), queries.raw(), num_queries, inv_leaf, out_idx.raw(), out_d2.raw());
+      nn_kernel<NNStrategy::Voxel5><<<grid, BLOCK>>>(hidx, target.keys.raw(), num_keys, target.points.raw(), queries.raw(), num_queries, inv_leaf, out_idx.raw(), out_d2.raw());
       break;
     case NNStrategy::ExactBF:
-      nn_kernel<NNStrategy::ExactBF><<<grid, BLOCK>>>(target.keys.raw(), num_keys, target.points.raw(), queries.raw(), num_queries, inv_leaf, out_idx.raw(), out_d2.raw());
+      nn_kernel<NNStrategy::ExactBF><<<grid, BLOCK>>>(hidx, target.keys.raw(), num_keys, target.points.raw(), queries.raw(), num_queries, inv_leaf, out_idx.raw(), out_d2.raw());
       break;
   }
   SGC_CHECK(cudaGetLastError());

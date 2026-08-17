@@ -62,3 +62,27 @@
 - 确定性归约：43 值 warp shuffle fp32 → lane0 fp64 定槽写 partial → CPU 按序 double 终和 → H 对称化。
 - 对拍（合成对，T 偏离最优 0.15m/0.5°）：ExactBF 全部 <0.1%；Voxel5 <0.5%；inlier 数一致；100 连跑逐位一致。
 - 调试记录：(1) T 在最优解时 ref_b≈0 导致相对误差虚高——测试改为偏置 T 使梯度有量级；(2) 内点计数曾只统计 lane 0 自身点（1/32 症状 0.0314），`__ballot_sync+__popc` 修复。
+
+## 2026-08-17 · T7 完成：LM + GicpGpu 引擎（含重大性能工程）
+
+**功能**：`sgc::GicpGpu::align`——LM 循环逐行移植 upstream（λ₀=1e-3/×10/外20/内10/LDLT/右乘 se3_exp/终止准则），`se3_exp` 精确移植。合成对端到端：与 upstream 位姿差 <1cm/0.3°（真实验收门），inlier 数 ±2%。
+
+**新增基础设施**：`VoxelHashIndex`（ulonglong2 单加载槽 + splitmix64 + atomicCAS 线性探测）建在 GpuCloud 上，协方差壳搜索/NN/配准内核全部受益。
+
+**性能攻坚记录（本日主要时间投入，KITTI 35k 体素帧）**：
+| 方案 | 协方差耗时 |
+|---|---|
+| 固定 5³ 邻域（精度错） | 11ms |
+| 自适应壳+二分探查 | 38ms |
+| 壳+哈希(两加载槽) MAX_SHELL=10 | 52ms |
+| 壳+哈希 MAX_SHELL=8 无暴力回退 | 10.2ms |
+| **壳+哈希 MAX_SHELL=4（当前）** | **2.4ms** |
+- 根因链：(1) KITTI 半稀疏（环间距 0.5-1m），大量点 20NN 在 1-2m 外；(2) 深层壳探查是随机访存延迟尾部（6.5% 点烧 ~1242 探查/点）；(3) N² 暴力在 35k 点 = ~400GB 流量不可行。
+- 20NN 壳分布实测：63% 在壳3内、76.5% 壳4、93.5% 壳8。**决策 MAX_SHELL=4**：76.5% 精确集合，其余用部分邻居（≥5 即有效平面），精度由 T11 KITTI 门裁决。
+- 小云（≤8192 点）保留 warp-轮转暴力精确路径（单测严格对拍依赖它）。
+- 分项（暖态）：read 0.2-0.5ms / H2D 0.23ms / downsample 0.7-1.2ms / covariance 1.5-4.1ms（随密度）。
+- 每迭代 align ~0.3-0.8ms（35k 点 Voxel5）。
+
+**遗留（T12）**：深层壳尾部延迟用 warp 协作探查根治；kernel launch 间隙用 CUDA Graph。
+
+**测试**：17/17（含 eval_error 自洽性检查、逐位确定性、ExactBF/Voxel5 线性化对拍、双引擎 align 对拍）。

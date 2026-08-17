@@ -5,9 +5,11 @@ find_package(CUDAToolkit REQUIRED)
 add_library(sgc STATIC
   src/core/buffer.cu
   src/voxel/downsample.cu
+  src/voxel/hash_index.cu
   src/preproc/covariance.cu
   src/search/nn.cu
   src/reg/linearize.cu
+  src/reg/gicp.cu
 )
 target_include_directories(sgc PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

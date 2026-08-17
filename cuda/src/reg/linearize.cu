@@ -6,6 +6,7 @@
 #include <sgc/core/check.hpp>
 #include <sgc/factor/gicp_math.cuh>
 #include <sgc/search/nn_query.cuh>
+#include <sgc/voxel/hash_index.hpp>
 
 namespace sgc {
 
@@ -18,6 +19,7 @@ constexpr int NUM_OUT = 43;  // H(36) + b(6) + e(1)
 // then a deterministic warp shuffle reduction (fp32) with fp64 partials at lane 0.
 template <NNStrategy Strategy, bool ErrorOnly>
 __global__ void linearize_kernel(
+  HashIndexView hidx,
   const float4* target_pts,
   const unsigned long long* target_keys,
   const float* target_covs,
@@ -69,7 +71,7 @@ __global__ void linearize_kernel(
       }
     } else {
       float d2 = 0.0f;
-      nn_query<Strategy>(target_keys, num_target, target_pts, make_float4(q.x, q.y, q.z, 1.0f), inv_leaf, &j, &d2);
+      nn_query<Strategy>(hidx, target_keys, num_target, target_pts, make_float4(q.x, q.y, q.z, 1.0f), inv_leaf, &j, &d2);
 
       if (j >= 0 && d2 <= max_dist_sq) {
         // M = (Ct + R * Cs * R^T)^-1
@@ -240,21 +242,22 @@ size_t Linearizer::linearize_and_reduce(
 
   const int grid = (num_source + block_ - 1) / block_;
   const float inv_leaf = 1.0f / leaf_size;
+  const HashIndexView hidx = target.index.view();
 
   switch (nn) {
     case NNStrategy::Voxel3:
       linearize_kernel<NNStrategy::Voxel3, false><<<grid, block_>>>(
-        target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
+        hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
         inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
       break;
     case NNStrategy::Voxel5:
       linearize_kernel<NNStrategy::Voxel5, false><<<grid, block_>>>(
-        target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
+        hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
         inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
       break;
     case NNStrategy::ExactBF:
       linearize_kernel<NNStrategy::ExactBF, false><<<grid, block_>>>(
-        target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
+        hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
         inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
       break;
   }
@@ -293,8 +296,9 @@ double Linearizer::eval_error_cached(const GpuCloud& target, const GpuCloud& sou
   upload_T(d_T_, T);
 
   const int grid = (num_source + block_ - 1) / block_;
+  const HashIndexView hidx = target.index.view();
   linearize_kernel<NNStrategy::Voxel3, true><<<grid, block_>>>(
-    target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, 0, d_T_.raw(), 0.0f, 0.0f, partials_.raw(),
+    hidx, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, 0, d_T_.raw(), 0.0f, 0.0f, partials_.raw(),
     inlier_count_.raw(), const_cast<int*>(cache.target_idx.raw()), const_cast<float*>(cache.mahalanobis.raw()));
   SGC_CHECK(cudaGetLastError());
 
