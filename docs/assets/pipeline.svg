@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="700" viewBox="0 0 1400 700" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect x="1" y="1" width="1398" height="698" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="700" y="52" text-anchor="middle" font-size="26" font-weight="700" fill="#24292f">One sort, every workload</text>
+  <text x="700" y="80" text-anchor="middle" font-size="15" fill="#57606a">the downsampler's sorted voxel buckets are the spatial index for the whole pipeline</text>
+
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+  </defs>
+
+  <!-- input -->
+  <rect x="530" y="110" width="340" height="56" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="700" y="145" text-anchor="middle" font-size="18" fill="#24292f">point cloud  (120k pts)</text>
+
+  <line x1="700" y1="166" x2="700" y2="196" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- voxel + sort -->
+  <rect x="470" y="200" width="460" height="76" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="700" y="231" text-anchor="middle" font-size="18" fill="#24292f">voxel keys (21-bit packed) + CUB radix sort</text>
+  <text x="700" y="256" text-anchor="middle" font-size="14" fill="#57606a">sorted voxel buckets · O(1) open-addressing hash</text>
+
+  <!-- three branches -->
+  <line x1="700" y1="276" x2="290" y2="330" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="700" y1="276" x2="700" y2="330" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="700" y1="276" x2="1110" y2="330" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+
+  <rect x="110" y="334" width="360" height="110" rx="8" fill="#ddf4e0" stroke="#76b900"/>
+  <text x="290" y="372" text-anchor="middle" font-size="18" font-weight="600" fill="#24292f">covariance kNN</text>
+  <text x="290" y="398" text-anchor="middle" font-size="14" fill="#57606a">warp-cooperative expanding shells</text>
+  <text x="290" y="420" text-anchor="middle" font-size="14" fill="#57606a">provably exact, early-stop bound</text>
+
+  <rect x="520" y="334" width="360" height="110" rx="8" fill="#ddf4e0" stroke="#76b900"/>
+  <text x="700" y="372" text-anchor="middle" font-size="18" font-weight="600" fill="#24292f">correspondence NN</text>
+  <text x="700" y="398" text-anchor="middle" font-size="14" fill="#57606a">5&#179; voxel window + adaptive growth</text>
+  <text x="700" y="420" text-anchor="middle" font-size="14" fill="#57606a">per-voxel pruning, transform in-kernel</text>
+
+  <rect x="930" y="334" width="360" height="110" rx="8" fill="#ddf4e0" stroke="#76b900"/>
+  <text x="1110" y="372" text-anchor="middle" font-size="18" font-weight="600" fill="#24292f">incremental voxel map</text>
+  <text x="1110" y="398" text-anchor="middle" font-size="14" fill="#57606a">hash insert + LRU eviction</text>
+  <text x="1110" y="420" text-anchor="middle" font-size="14" fill="#57606a">VGICP scan-to-model</text>
+
+  <text x="290" y="330" text-anchor="middle" font-size="0"> </text>
+
+  <line x1="290" y1="444" x2="580" y2="500" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="700" y1="444" x2="700" y2="500" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+  <line x1="1110" y1="444" x2="820" y2="500" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+
+  <rect x="440" y="504" width="520" height="66" rx="8" fill="#f6f8fa" stroke="#d0d7de"/>
+  <text x="700" y="533" text-anchor="middle" font-size="18" fill="#24292f">GICP / VGICP factors &#8594; ordered fp64 reduction</text>
+  <text x="700" y="557" text-anchor="middle" font-size="14" fill="#57606a">warp shuffle fp32 &#8594; fixed-slot fp64 partials &#8594; host double sum</text>
+
+  <line x1="700" y1="570" x2="700" y2="600" stroke="#57606a" stroke-width="2" marker-end="url(#a)"/>
+
+  <rect x="560" y="604" width="280" height="56" rx="8" fill="#24292f"/>
+  <text x="700" y="639" text-anchor="middle" font-size="18" font-weight="600" fill="#ffffff">pose estimate  (LM, double)</text>
+</svg>
