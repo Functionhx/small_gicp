@@ -1,47 +1,85 @@
 # small_gicp-cuda
 
-**CUDA-exclusive point cloud registration for NVIDIA GPUs** — desktop dGPUs and Jetson modules.
-[中文说明](README_zh.md)
+**Point cloud registration at frame rate, on any NVIDIA GPU** — from a desktop dGPU to a
+Jetson Orin module. [中文说明](README_zh.md)
 
-GICP (scan-to-scan) and VGICP (scan-to-model) reimplemented GPU-native, with bit-level
-fidelity to the CPU reference and single-frame latencies in the milliseconds.
+GICP and VGICP, rewritten for the GPU from the kernel up — with the accuracy contract kept
+intact: the output trajectory matches the CPU original to ≤0.01%, on every frame, every run.
 
-## Results
+> **7.5×** faster than the CPU original over a full KITTI loop · **162 fps** sustained ·
+> **bit-identical** reruns · deterministic across GPU architectures (sm_87 ≡ sm_89) ·
+> **358 MiB** steady GPU memory · **1.5×** faster than NVIDIA's own cuPCL cuICP
 
-| device | engine | CPU ref (upstream, serial) | this work (GPU) | speedup | GPU vs CPU accuracy |
+No kd-trees. No CPU fallback. No accuracy trade-off.
+
+## One frame, end to end
+
+A 120k-point LiDAR frame goes in, a pose comes out — downsampling, exact kNN-20 covariance
+estimation, and the full LM loop all included in the timing:
+
+| | upstream (CPU) | this work (GPU) | |
+|---|---|---|---|
+| RTX 4070 + Ryzen 9950X, GICP | 43.9 ms | **6.0 ms** | **7.3×** |
+| RTX 4070 + Ryzen 9950X, VGICP | 34.4 ms | **5.6 ms** | **6.1×** |
+| Jetson Orin NX, GICP | 118.3 ms | **16.5 ms** | **7.2×** |
+| Jetson Orin NX, VGICP | 102.3 ms | **14.2 ms** | **7.2×** |
+
+And it holds up over distance. The complete KITTI-00 sequence (4541 frames, the full 3.7 km
+loop, chained frame-to-frame with no loop closure):
+
+| engine | upstream CPU | this work | speedup | fps | trajectory vs upstream |
 |---|---|---|---|---|---|
-| RTX 4070 + Ryzen 9950X | GICP | 43.9 ms | **6.0 ms** | 7.3x | APE/RPE diff <= 0.01% |
-| RTX 4070 + Ryzen 9950X | VGICP | 34.4 ms | **5.6 ms** | 6.1x | <= 0.01% |
-| Jetson Orin NX (MAXN) | GICP | 118.3 ms | **16.5 ms** | 7.2x | 1.2 cm over 100 frames |
-| Jetson Orin NX (MAXN) | VGICP | 102.3 ms | **14.2 ms** | 7.2x | 0.2 cm over 100 frames |
+| GICP  | 45.2 ms | **6.0 ms** | 7.5× | 162 | within 0.22% over 4541 frames |
+| VGICP | 35.5 ms | **5.7 ms** | 6.2× | 170 | within 1.45% over 4541 frames |
 
-Full KITTI-00 sequence (all 4541 frames, the complete 3.7 km loop): GICP 45.2 -> **6.0 ms**
-(7.5x, 162 fps), VGICP 35.5 -> **5.7 ms** (6.2x, 170 fps); trajectories stay within 0.22%/1.45%
-of upstream over the whole run, 5 reruns are bit-identical, GPU memory steady at 358 MiB.
-Timing includes downsampling + covariance estimation + registration. Full methodology:
-[BENCHMARK_GPU.md](BENCHMARK_GPU.md) (includes a fair comparison against NVIDIA cuPCL's cuICP:
-1.5-1.65x faster at matched inputs).
+## The idea: retire the kd-tree
 
-Cross-architecture determinism: the GPU pipeline produces **bit-identical trajectories on
-sm_87 and sm_89** (APE = 0.0000 m across devices).
+Upstream's pipeline builds a kd-tree per cloud, then queries it for covariance kNN — and
+again for every correspondence, of every point, in every LM iteration. This library deletes
+that data structure. The downsampler's radix-sorted voxel buckets *are* the spatial index,
+and every later stage reads them through O(1) hash probes:
 
-## How this differs from the original small_gicp
+```
+120k points ─▶ voxel keys ─▶ one radix sort ──┬─▶ bucket centroids          (downsampling)
+                                              ├─▶ expanding-shell kNN      (covariances, exact)
+                                              ├─▶ 5³-window + adaptive NN  (correspondences)
+                                              └─▶ O(1) hash insert/probe   (incremental voxel map)
+```
 
-| | small_gicp (upstream) | small_gicp-cuda (this repo) |
+One sort pays for everything. On top of it:
+
+- **Warp-cooperative exact search.** Covariance kNN expands voxel shells with a rigorous
+  early-stop bound — exact results, no fixed-radius compromise. Sparse regions fall back to
+  warp-level brute force.
+- **Numerics that survive the GPU.** fp32 storage and factor math where bandwidth matters,
+  fp64 warp-shuffle reductions where cancellation hurts, and the final LM solve in double on
+  the CPU — LM constants ported line-by-line from upstream.
+- **Determinism as a feature.** Fixed launch configs and ordered reductions mean five reruns
+  of a 4541-frame sequence produce byte-identical trajectory files, and an Orin and a
+  desktop GPU produce the *same* bytes (cross-device APE = 0.0000 m). Threaded CPU code
+  can't promise that; this can.
+
+## How it differs from the original small_gicp
+
+| | small_gicp (upstream) | small_gicp-cuda |
 |---|---|---|
-| Target | CPU (header-only, OpenMP/TBB optional) | **NVIDIA GPU required** (dGPU or Jetson), no CPU fallback |
-| Spatial index | kd-tree (nanoflann-style) per cloud | **radix-sorted voxel buckets + O(1) hash** built by downsampling itself — one pass serves downsampling, covariance kNN, correspondence search, and the incremental voxel map; no kd-tree anywhere |
-| Covariance kNN | kd-tree exact kNN | warp-cooperative expanding-shell search with a rigorous early-stop bound (exact), brute-force completion for sparse clouds |
-| Correspondence | kd-tree NN per iteration | warp-cooperative batch NN: 5^3 window + adaptive expansion with per-voxel pruning |
-| Precision | all double | fp32 storage/factor math + **fp64 warp reductions** and CPU double LM solve |
-| Determinism | threaded CPU reductions are scheduling-dependent | fixed launch configs + ordered reductions: **run-to-run and cross-SM-architecture bit-identical** |
-| Engines | ICP / Plane-ICP / GICP / VGICP via templates | GICP + VGICP (`sgc::GicpGpu`, `sgc::VgicpGpu`), LM constants ported line-by-line from upstream |
-| Extras | PCL adapter, ROS bridge, Python bindings | none of those (yet) — the CPU reference stays in-tree as the parity baseline |
-| Verification | upstream test suite | upstream kept unmodified + **20 kernel-parity tests** that build both implementations and assert agreement (downsampling, covariance, NN, H/b/e, voxel map, end-to-end) |
+| Target | CPU, header-only (OpenMP/TBB optional) | **NVIDIA GPU required**, dGPU or Jetson |
+| Spatial index | kd-tree per cloud | sorted voxel buckets + O(1) hash — **no kd-tree anywhere** |
+| Covariance kNN | kd-tree exact kNN | warp-cooperative expanding shells (exact, early-stop bound) |
+| Correspondences | kd-tree NN per iteration | warp-cooperative batch NN with per-voxel pruning |
+| Precision | all double | fp32 math + fp64 reductions + CPU double LM solve |
+| Determinism | thread-scheduling dependent | run-to-run and cross-architecture **bit-identical** |
+| Engines | ICP / Plane-ICP / GICP / VGICP | GICP + VGICP (`sgc::GicpGpu`, `sgc::VgicpGpu`) |
+| Extras | PCL adapter, ROS bridge, Python bindings | not yet — CPU reference kept in-tree as parity baseline |
+| Verification | upstream test suite | upstream unmodified + **20 kernel-parity tests** asserting both implementations agree, stage by stage |
 
-The upstream CPU implementation is kept unmodified in-tree (`include/small_gicp`, `src/`)
-exactly because the parity suite needs it: this repo's accuracy claim is "identical to
-upstream", tested kernel by kernel. The `master` branch tracks the upstream baseline.
+The upstream CPU implementation stays in-tree (`include/small_gicp`, `src/`) on purpose: this
+repo's accuracy claim is "identical to upstream", and the parity suite tests exactly that,
+kernel by kernel. `master` tracks the upstream baseline.
+
+For how this compares with NVIDIA's cuPCL (cuICP): 1.5–1.65× faster at matched inputs, while
+also providing the distribution-to-distribution GICP/VGICP objectives cuPCL doesn't have —
+full protocol in [BENCHMARK_GPU.md](BENCHMARK_GPU.md).
 
 ## Quick start
 

@@ -1,44 +1,80 @@
 # small_gicp-cuda（中文说明）
 
-**CUDA 专属的点云配准库，面向所有 NVIDIA GPU**——桌面独显与 Jetson 嵌入式模块。
+**让点云配准跑满帧率，任意 NVIDIA GPU**——从桌面独显到 Jetson Orin 模组。
 [English](README.md)
 
-GICP（帧到帧）与 VGICP（帧到地图）的 GPU 原生重实现：与 CPU 参考实现保持逐位一致的
-精度，单帧延迟毫秒级。
+GICP 与 VGICP 的 GPU 从零重写，精度契约原封不动：输出轨迹与 CPU 原版逐帧吻合到
+≤0.01%。
 
-## 结果
+> 比 CPU 原版在完整 KITTI 环路上快 **7.5×** · 持续 **162 fps** · 重跑**逐位一致** ·
+> 跨 GPU 架构确定性（sm_87 ≡ sm_89）· GPU 显存恒定 **358 MiB** · 比 NVIDIA 自家
+> cuPCL cuICP 快 **1.5×**
 
-| 设备 | 引擎 | CPU 基线（upstream 串行） | 本库（GPU） | 加速比 | GPU 与 CPU 精度差 |
+无 kd-tree。无 CPU 回退。无精度折损。
+
+## 一帧的完整旅程
+
+12 万点 LiDAR 帧进，位姿出——降采样、精确 kNN-20 协方差估计、完整 LM 迭代全部计入
+计时：
+
+| | upstream（CPU） | 本库（GPU） | |
+|---|---|---|---|
+| RTX 4070 + 锐龙 9950X，GICP | 43.9 ms | **6.0 ms** | **7.3×** |
+| RTX 4070 + 锐龙 9950X，VGICP | 34.4 ms | **5.6 ms** | **6.1×** |
+| Jetson Orin NX，GICP | 118.3 ms | **16.5 ms** | **7.2×** |
+| Jetson Orin NX，VGICP | 102.3 ms | **14.2 ms** | **7.2×** |
+
+长序列同样站得住。KITTI-00 完整序列（4541 帧，3.7 km 环路，无回环检测的链式帧间
+配准）：
+
+| 引擎 | upstream CPU | 本库 | 加速比 | fps | 轨迹与 upstream 对比 |
 |---|---|---|---|---|---|
-| RTX 4070 + 锐龙 9950X | GICP | 43.9 ms | **6.0 ms** | 7.3× | APE/RPE 差 ≤ 0.01% |
-| RTX 4070 + 锐龙 9950X | VGICP | 34.4 ms | **5.6 ms** | 6.1× | ≤ 0.01% |
-| Jetson Orin NX（MAXN） | GICP | 118.3 ms | **16.5 ms** | 7.2× | 100 帧累计 1.2 cm |
-| Jetson Orin NX（MAXN） | VGICP | 102.3 ms | **14.2 ms** | 7.2× | 100 帧累计 0.2 cm |
+| GICP  | 45.2 ms | **6.0 ms** | 7.5× | 162 | 4541 帧全程相差 0.22% |
+| VGICP | 35.5 ms | **5.7 ms** | 6.2× | 170 | 4541 帧全程相差 1.45% |
 
-KITTI-00 **全序列（4541 帧，完整 3.7 km 环路）**：GICP 45.2 → **6.0 ms**（7.5×，162 fps），
-VGICP 35.5 → **5.7 ms**（6.2×，170 fps）；整条轨迹与 upstream 相差 0.22%/1.45%，5 次重跑
-逐位一致，GPU 显存恒定 358 MiB。计时含降采样 + 协方差估计 + 配准全流程。完整方法论见
-[BENCHMARK_GPU.md](BENCHMARK_GPU.md)（含与 NVIDIA cuPCL cuICP 的公平对比：同等输入下
-快 1.5-1.65×）。
+## 核心思路：让 kd-tree 退休
 
-跨架构确定性：GPU 管线在 **sm_87 与 sm_89 上输出逐位相同的轨迹**（跨设备 APE = 0.0000 m）。
+upstream 的管线为每帧点云建一棵 kd-tree，协方差 kNN 查它——之后每次迭代的每个点的
+对应点搜索再查它。本库直接删掉这个数据结构：降采样器产出的 radix 排序体素桶**本身
+就是空间索引**，后续所有阶段都通过 O(1) 哈希探测读取它：
+
+```
+12万点 ─▶ 体素 key ─▶ 一次 radix sort ──┬─▶ 桶质心              （降采样）
+                                        ├─▶ 扩张壳 kNN          （协方差，精确）
+                                        ├─▶ 5³ 窗口 + 自适应 NN （对应点搜索）
+                                        └─▶ O(1) 哈希插入/探测 （增量体素地图）
+```
+
+一次排序，全家受益。在此之上：
+
+- **warp 协作精确搜索**。协方差 kNN 以严格的早停界逐壳扩张——结果是精确的，不做固定
+  半径妥协；稀疏区域回退 warp 级暴力搜索。
+- **能在 GPU 上活下来的数值方案**。带宽敏感处用 fp32 存储与因子计算，相消敏感处用
+  fp64 warp shuffle 归约，最终 LM 在 CPU 上以 double 求解——LM 常数逐行移植自 upstream。
+- **确定性即特性**。固定 launch 配置 + 有序归约，4541 帧序列连跑五次轨迹文件字节级
+  相同，Orin 与桌面 GPU 输出**同样的字节**（跨设备 APE = 0.0000 m）。多线程 CPU 代码
+  给不了这个承诺；这里可以。
 
 ## 与原版 small_gicp 的区别
 
-| | small_gicp（上游） | small_gicp-cuda（本仓库） |
+| | small_gicp（上游） | small_gicp-cuda |
 |---|---|---|
-| 目标平台 | CPU（header-only，可选 OpenMP/TBB） | **必须 NVIDIA GPU**（独显或 Jetson），无 CPU 回退 |
-| 空间索引 | 每云建 kd-tree（nanoflann 风格） | **降采样自身的 radix 排序体素桶 + O(1) 哈希**——一趟排序同时服务降采样、协方差 kNN、对应点搜索与增量体素地图；全程无 kd-tree |
-| 协方差 kNN | kd-tree 精确 kNN | warp 协作扩张壳搜索 + 严格早停界（精确），稀疏云用暴力补全 |
-| 对应点搜索 | 每次迭代 kd-tree NN | warp 协作批量 NN：5³ 窗口 + 自适应扩张（逐体素剪枝） |
-| 数值精度 | 全程 double | fp32 存储/因子计算 + **fp64 warp 归约** + CPU 端 double LM 求解 |
-| 确定性 | 多线程 CPU 归约受调度影响 | 固定 launch 配置 + 有序归约：**逐次运行、跨 SM 架构逐位一致** |
-| 引擎 | 模板化 ICP / Plane-ICP / GICP / VGICP | GICP + VGICP（`sgc::GicpGpu`、`sgc::VgicpGpu`），LM 常数逐行移植自上游 |
-| 周边能力 | PCL 适配、ROS 桥、Python 绑定 | 暂无——CPU 参考实现保留在树内作为对拍基线 |
-| 验证 | 上游测试套件 | 上游代码原样保留 + **20 个内核级对拍测试**（同时构建两种实现并逐项断言一致：降采样、协方差、NN、H/b/e、体素地图、端到端） |
+| 目标平台 | CPU，header-only（可选 OpenMP/TBB） | **必须 NVIDIA GPU**，独显或 Jetson |
+| 空间索引 | 每云一棵 kd-tree | 排序体素桶 + O(1) 哈希——**全程无 kd-tree** |
+| 协方差 kNN | kd-tree 精确 kNN | warp 协作扩张壳（精确，带早停界） |
+| 对应点 | 每次迭代 kd-tree NN | warp 协作批量 NN + 逐体素剪枝 |
+| 数值精度 | 全程 double | fp32 计算 + fp64 归约 + CPU double LM |
+| 确定性 | 受线程调度影响 | 逐次运行、跨架构**逐位一致** |
+| 引擎 | ICP / Plane-ICP / GICP / VGICP | GICP + VGICP（`sgc::GicpGpu`、`sgc::VgicpGpu`） |
+| 周边能力 | PCL 适配、ROS 桥、Python 绑定 | 暂无——CPU 参考实现保留在树内作对拍基线 |
+| 验证 | 上游测试套件 | 上游原样保留 + **20 个内核对拍测试**逐阶段断言两种实现一致 |
 
-上游 CPU 实现原样保留在树内（`include/small_gicp`、`src/`），正是因为对拍测试套件需要
-它：本仓库的精度主张就是"与 upstream 一致"，并按内核逐项验证。`master` 分支跟踪上游基线。
+上游 CPU 实现保留在树内（`include/small_gicp`、`src/`）是有意为之：本仓库的精度主张
+就是"与 upstream 一致"，对拍套件按内核逐项验证的正是这件事。`master` 分支跟踪上游
+基线。
+
+与 NVIDIA cuPCL（cuICP）的对比：同等输入下快 1.5–1.65×，且提供 cuPCL 没有的
+分布到分布 GICP/VGICP 目标函数——完整对比协议见 [BENCHMARK_GPU.md](BENCHMARK_GPU.md)。
 
 ## 快速开始
 
@@ -67,8 +103,9 @@ sgc::GicpGpu reg;                                                 // LM 常数�
 auto result = reg.align(target, source, init_T, 0.25f);
 ```
 
-VGICP 帧到地图：`sgc::VoxelHashMap`（带 LRU 的增量高斯体素地图）+ `sgc::VgicpGpu::align(...)`。
-带运行时策略切换的基准工具：`cuda/bench/odometry_gpu`
+VGICP 帧到地图：`sgc::VoxelHashMap`（带 LRU 的增量高斯体素地图）+
+`sgc::VgicpGpu::align(...)`。带运行时策略切换的基准工具：
+`cuda/bench/odometry_gpu`
 （`--exec full-gpu|hybrid|cpu --engine gicp|vgicp --nn voxel3|voxel5|exact-bf`）。
 
 ## 文档
