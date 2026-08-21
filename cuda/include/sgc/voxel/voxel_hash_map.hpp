@@ -19,6 +19,9 @@ class VoxelHashMap {
 public:
   explicit VoxelHashMap(double leaf_size, size_t lru_horizon = 100, size_t lru_clear_cycle = 10);
 
+  /// @brief Remove all voxels while retaining the allocated table and scratch capacity.
+  void clear();
+
   /// @brief Insert a preprocessed cloud transformed by T.
   void insert(const GpuCloud& cloud, const Eigen::Isometry3d& T);
 

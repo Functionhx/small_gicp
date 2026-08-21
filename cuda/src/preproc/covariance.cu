@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include <sgc/preproc/covariance.hpp>
 
+#include <stdexcept>
+
 #include <sgc/core/check.hpp>
 #include <sgc/voxel/hash_index.hpp>
 #include <sgc/voxel/voxel_key.hpp>
@@ -70,19 +72,117 @@ __device__ void jacobi_eigen3x3(float* a, float* v) {
   }
 }
 
-// Compute the covariance with eigenvalue replacement from a neighbor list.
-__device__ void compute_cov_from_neighbors(const float4* points, const int* idx, int n, float* out) {
+// Closed-form smallest eigenvector for a symmetric 3x3 matrix. This replaces the
+// transcendental-heavy Jacobi loop on the common path; nearly degenerate matrices fall
+// back to Jacobi to preserve robustness.
+__device__ bool smallest_eigenvector_closed_form(const float* a, float* nx, float* ny, float* nz) {
+  const float a00 = a[0], a01 = a[1], a02 = a[2];
+  const float a11 = a[4], a12 = a[5], a22 = a[8];
+  const float offdiag_sq = a01 * a01 + a02 * a02 + a12 * a12;
+
+  if (offdiag_sq < 1e-20f) {
+    int axis = 0;
+    if (a11 < a00) {
+      axis = 1;
+    }
+    if (a22 < (axis == 0 ? a00 : a11)) {
+      axis = 2;
+    }
+    *nx = axis == 0 ? 1.0f : 0.0f;
+    *ny = axis == 1 ? 1.0f : 0.0f;
+    *nz = axis == 2 ? 1.0f : 0.0f;
+    return true;
+  }
+
+  const float q = (a00 + a11 + a22) / 3.0f;
+  const float b00 = a00 - q, b11 = a11 - q, b22 = a22 - q;
+  const float p = sqrtf((b00 * b00 + b11 * b11 + b22 * b22 + 2.0f * offdiag_sq) / 6.0f);
+  if (!(p > 1e-12f)) {
+    return false;
+  }
+
+  const float inv_p = 1.0f / p;
+  const float c00 = b00 * inv_p, c01 = a01 * inv_p, c02 = a02 * inv_p;
+  const float c11 = b11 * inv_p, c12 = a12 * inv_p, c22 = b22 * inv_p;
+  const float det_b = c00 * (c11 * c22 - c12 * c12) - c01 * (c01 * c22 - c12 * c02) + c02 * (c01 * c12 - c11 * c02);
+  const float r = fminf(1.0f, fmaxf(-1.0f, 0.5f * det_b));
+  const float phi = acosf(r) / 3.0f;
+  constexpr float TWO_PI_OVER_THREE = 2.0943951023931954923f;
+  const float lambda = q + 2.0f * p * cosf(phi + TWO_PI_OVER_THREE);
+  const float lambda_max = q + 2.0f * p * cosf(phi);
+  const float lambda_mid = 3.0f * q - lambda - lambda_max;
+  if (lambda_mid - lambda <= 1e-4f * p) {
+    return false;  // The smallest eigenspace is poorly conditioned; use Jacobi.
+  }
+
+  const float m00 = a00 - lambda, m11 = a11 - lambda, m22 = a22 - lambda;
+  // Cross products of row pairs of A-lambda*I. The longest is the most stable null vector.
+  const float c0x = a01 * a12 - a02 * m11;
+  const float c0y = a02 * a01 - m00 * a12;
+  const float c0z = m00 * m11 - a01 * a01;
+  const float c1x = a01 * m22 - a02 * a12;
+  const float c1y = a02 * a02 - m00 * m22;
+  const float c1z = m00 * a12 - a01 * a02;
+  const float c2x = m11 * m22 - a12 * a12;
+  const float c2y = a12 * a02 - a01 * m22;
+  const float c2z = a01 * a12 - m11 * a02;
+  const float n0 = c0x * c0x + c0y * c0y + c0z * c0z;
+  const float n1 = c1x * c1x + c1y * c1y + c1z * c1z;
+  const float n2 = c2x * c2x + c2y * c2y + c2z * c2z;
+
+  float vx = c0x, vy = c0y, vz = c0z, norm_sq = n0;
+  if (n1 > norm_sq) {
+    vx = c1x;
+    vy = c1y;
+    vz = c1z;
+    norm_sq = n1;
+  }
+  if (n2 > norm_sq) {
+    vx = c2x;
+    vy = c2y;
+    vz = c2z;
+    norm_sq = n2;
+  }
+  if (!(norm_sq > 1e-20f)) {
+    return false;
+  }
+
+  const float inv_norm = rsqrtf(norm_sq);
+  vx *= inv_norm;
+  vy *= inv_norm;
+  vz *= inv_norm;
+  const float rx = a00 * vx + a01 * vy + a02 * vz - lambda * vx;
+  const float ry = a01 * vx + a11 * vy + a12 * vz - lambda * vy;
+  const float rz = a02 * vx + a12 * vy + a22 * vz - lambda * vz;
+  const float matrix_norm_sq = a00 * a00 + a11 * a11 + a22 * a22 + 2.0f * offdiag_sq;
+  if (rx * rx + ry * ry + rz * rz > 1e-8f * fmaxf(matrix_norm_sq, 1e-20f)) {
+    return false;
+  }
+  *nx = vx;
+  *ny = vy;
+  *nz = vz;
+  return true;
+}
+
+// Compute normals and/or covariance with eigenvalue replacement from a neighbor list.
+// Null outputs are skipped so ICP variants pay only for the features they require.
+__device__ void compute_features_from_neighbors(const float4* points, const int* idx, int n, const float4 query_point, float* out_cov, float4* out_normal) {
   if (n < 5) {
-    // Upstream sets the identity matrix for points with too few neighbors
-    out[0] = 1.0f;
-    out[1] = 0.0f;
-    out[2] = 0.0f;
-    out[3] = 0.0f;
-    out[4] = 1.0f;
-    out[5] = 0.0f;
-    out[6] = 0.0f;
-    out[7] = 0.0f;
-    out[8] = 1.0f;
+    // Upstream uses normal=0 and covariance=I for insufficient neighborhoods.
+    if (out_normal != nullptr) {
+      *out_normal = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if (out_cov != nullptr) {
+      out_cov[0] = 1.0f;
+      out_cov[1] = 0.0f;
+      out_cov[2] = 0.0f;
+      out_cov[3] = 0.0f;
+      out_cov[4] = 1.0f;
+      out_cov[5] = 0.0f;
+      out_cov[6] = 0.0f;
+      out_cov[7] = 0.0f;
+      out_cov[8] = 1.0f;
+    }
     return;
   }
 
@@ -106,35 +206,54 @@ __device__ void compute_cov_from_neighbors(const float4* points, const int* idx,
   const float mx = sx * inv_n, my = sy * inv_n, mz = sz * inv_n;
 
   float a[9] = {
-    (sxx - mx * sx) * inv_n, (sxy - mx * sy) * inv_n, (sxz - mx * sz) * inv_n,  //
-    (sxy - my * sx) * inv_n, (syy - my * sy) * inv_n, (syz - my * sz) * inv_n,  //
-    (sxz - mz * sx) * inv_n, (syz - mz * sy) * inv_n, (szz - mz * sz) * inv_n};
+    (sxx - mx * sx) * inv_n,
+    (sxy - mx * sy) * inv_n,
+    (sxz - mx * sz) * inv_n,  //
+    (sxy - my * sx) * inv_n,
+    (syy - my * sy) * inv_n,
+    (syz - my * sz) * inv_n,  //
+    (sxz - mz * sx) * inv_n,
+    (syz - mz * sy) * inv_n,
+    (szz - mz * sz) * inv_n};
 
-  float v[9];
-  jacobi_eigen3x3(a, v);
-
-  // Smallest-eigenvalue column (post-Jacobi diagonal)
-  int min_axis = 0;
-  if (a[4] < a[0]) {
-    min_axis = 1;
+  float nx, ny, nz;
+  if (!smallest_eigenvector_closed_form(a, &nx, &ny, &nz)) {
+    float v[9];
+    jacobi_eigen3x3(a, v);
+    int min_axis = 0;
+    if (a[4] < a[0]) {
+      min_axis = 1;
+    }
+    if (a[8] < a[min_axis * 3 + min_axis]) {
+      min_axis = 2;
+    }
+    nx = v[min_axis];
+    ny = v[3 + min_axis];
+    nz = v[6 + min_axis];
   }
-  if (a[8] < a[min_axis * 3 + min_axis]) {
-    min_axis = 2;
-  }
-  const float nx = v[min_axis];
-  const float ny = v[3 + min_axis];
-  const float nz = v[6 + min_axis];
 
-  // cov = I - 0.999 * n * n^T  (eigenvalue replacement (1e-3, 1, 1))
-  out[0] = 1.0f - 0.999f * nx * nx;
-  out[1] = -0.999f * nx * ny;
-  out[2] = -0.999f * nx * nz;
-  out[3] = -0.999f * ny * nx;
-  out[4] = 1.0f - 0.999f * ny * ny;
-  out[5] = -0.999f * ny * nz;
-  out[6] = -0.999f * nz * nx;
-  out[7] = -0.999f * nz * ny;
-  out[8] = 1.0f - 0.999f * nz * nz;
+  if (out_normal != nullptr) {
+    // Mirror small_gicp::NormalSetter: orient the normal toward the sensor origin.
+    if (query_point.x * nx + query_point.y * ny + query_point.z * nz > 0.0f) {
+      nx = -nx;
+      ny = -ny;
+      nz = -nz;
+    }
+    *out_normal = make_float4(nx, ny, nz, 0.0f);
+  }
+
+  if (out_cov != nullptr) {
+    // cov = I - 0.999 * n * n^T  (eigenvalue replacement (1e-3, 1, 1))
+    out_cov[0] = 1.0f - 0.999f * nx * nx;
+    out_cov[1] = -0.999f * nx * ny;
+    out_cov[2] = -0.999f * nx * nz;
+    out_cov[3] = -0.999f * ny * nx;
+    out_cov[4] = 1.0f - 0.999f * ny * ny;
+    out_cov[5] = -0.999f * ny * nz;
+    out_cov[6] = -0.999f * nz * nx;
+    out_cov[7] = -0.999f * nz * ny;
+    out_cov[8] = 1.0f - 0.999f * nz * nz;
+  }
 }
 
 // Lexicographic (dist, index) ordering: makes the selected k-set independent of processing order.
@@ -143,13 +262,12 @@ __device__ __forceinline__ bool lex_less(float d2_a, int j_a, float d2_b, int j_
 }
 
 constexpr int COV_BLOCK = 128;
-constexpr int COV_STRIDE = MAX_K + 1;
 
 // Pass 1 (warp-cooperative): exact kNN over voxel buckets with a rigorous early-stop bound.
 //        One warp per point: lanes stride over each shell's voxels (latency hidden), hits are
 //        merged into a shared-memory top-k by lane 0 with lexicographic (dist, index) ordering.
 //        Exact for every point whose k-th neighbor lies within MAX_SHELL voxels.
-constexpr int COV_WARPS = 8;
+constexpr int COV_WARPS = 4;
 constexpr int COV_WSTRIDE = MAX_K + 1;
 
 __global__ void covariance_shell_kernel(
@@ -159,7 +277,9 @@ __global__ void covariance_shell_kernel(
   int num_points,
   float inv_leaf,
   int num_neighbors,
+  int max_shell,
   float* covs,
+  float4* normals,
   unsigned int* counts) {
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x / 32;
@@ -192,8 +312,7 @@ __global__ void covariance_shell_kernel(
   const float frac_min = fminf(fminf(fminf(fx, 1.0f - fx), fminf(fy, 1.0f - fy)), fminf(fz, 1.0f - fz));
 
   // Warp-cooperative shells stay cheap far beyond the per-thread version
-  constexpr int MAX_SHELL = 12;
-  for (int s = 0; s <= MAX_SHELL && s_stop[warp] == 0; s++) {
+  for (int s = 0; s <= max_shell && s_stop[warp] == 0; s++) {
     const int n3 = (2 * s + 1) * (2 * s + 1) * (2 * s + 1);
 
     // Round-based scan: each round every lane probes one voxel, then all 32 candidates
@@ -258,7 +377,7 @@ __global__ void covariance_shell_kernel(
     // Only a search that fired the early-stop bound is provably exact; anything else
     // (including a full set at the shell cap) falls through to the brute-force pass.
     counts[query] = s_stop[warp] != 0 ? static_cast<unsigned int>(n) : (static_cast<unsigned int>(n) | 0x80000000u);
-    compute_cov_from_neighbors(points, jj, n, covs + query * 9);
+    compute_features_from_neighbors(points, jj, n, pi, covs != nullptr ? covs + query * 9 : nullptr, normals != nullptr ? normals + query : nullptr);
   }
 }
 
@@ -271,7 +390,7 @@ __global__ void covariance_bf_select_kernel(
   const float4* points,
   int num_points,
   int num_neighbors,
-  int* sel_j,          // [query * MAX_K + r]
+  int* sel_j,           // [query * MAX_K + r]
   unsigned int* found,  // [query]
   const unsigned int* counts) {
   const int lane = threadIdx.x & 31;
@@ -336,21 +455,40 @@ __global__ void covariance_bf_select_kernel(
 }
 
 // Pass 2b: covariance computation from the selected neighbor indices (simple per-thread kernel).
-__global__ void covariance_bf_cov_kernel(const float4* points, int num_points, const int* sel_j, const unsigned int* found, float* covs) {
+__global__ void covariance_bf_cov_kernel(const float4* points, int num_points, const int* sel_j, const unsigned int* found, float* covs, float4* normals) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_points || found[i] == 0) {
     return;
   }
-  compute_cov_from_neighbors(points, sel_j + i * MAX_K, static_cast<int>(found[i]), covs + i * 9);
+  compute_features_from_neighbors(
+    points,
+    sel_j + i * MAX_K,
+    static_cast<int>(found[i]),
+    points[i],
+    covs != nullptr ? covs + i * 9 : nullptr,
+    normals != nullptr ? normals + i : nullptr);
 }
 
 }  // namespace
 
-void estimate_covariances(GpuCloud& cloud, float leaf_size, int num_neighbors) {
+namespace {
+
+void estimate_features(GpuCloud& cloud, float leaf_size, int num_neighbors, int max_shell, bool with_covariances, bool with_normals) {
   if (cloud.size() == 0) {
     return;
   }
-  cloud.covs.resize(cloud.size() * 9);
+  if (num_neighbors < 1 || num_neighbors > MAX_K) {
+    throw std::invalid_argument("num_neighbors must be in [1, 32]");
+  }
+  if (max_shell < 1 || max_shell > 12) {
+    throw std::invalid_argument("max_shell must be in [1, 12]");
+  }
+  if (with_covariances) {
+    cloud.covs.resize(cloud.size() * 9);
+  }
+  if (with_normals) {
+    cloud.normals.resize(cloud.size());
+  }
 
   const int num_points = static_cast<int>(cloud.size());
   const float inv_leaf = 1.0f / leaf_size;
@@ -368,7 +506,17 @@ void estimate_covariances(GpuCloud& cloud, float leaf_size, int num_neighbors) {
   {
     constexpr int WARP_BLOCK = COV_WARPS * 32;
     const int grid = (num_points + COV_WARPS - 1) / COV_WARPS;
-    covariance_shell_kernel<<<grid, WARP_BLOCK>>>(cloud.index.view(), cloud.points.raw(), cloud.keys.raw(), num_points, inv_leaf, num_neighbors, cloud.covs.raw(), counts.raw());
+    covariance_shell_kernel<<<grid, WARP_BLOCK>>>(
+      cloud.index.view(),
+      cloud.points.raw(),
+      cloud.keys.raw(),
+      num_points,
+      inv_leaf,
+      num_neighbors,
+      max_shell,
+      with_covariances ? cloud.covs.raw() : nullptr,
+      with_normals ? cloud.normals.raw() : nullptr,
+      counts.raw());
     SGC_CHECK(cudaGetLastError());
   }
   // Exact brute-force completion only for small clouds: the O(N^2) warp-rounds cost is
@@ -380,9 +528,29 @@ void estimate_covariances(GpuCloud& cloud, float leaf_size, int num_neighbors) {
     covariance_bf_select_kernel<<<grid, BF_BLOCK>>>(cloud.points.raw(), num_points, num_neighbors, sel_j.raw(), found.raw(), counts.raw());
     SGC_CHECK(cudaGetLastError());
     const int grid2 = (num_points + COV_BLOCK - 1) / COV_BLOCK;
-    covariance_bf_cov_kernel<<<grid2, COV_BLOCK>>>(cloud.points.raw(), num_points, sel_j.raw(), found.raw(), cloud.covs.raw());
+    covariance_bf_cov_kernel<<<grid2, COV_BLOCK>>>(
+      cloud.points.raw(),
+      num_points,
+      sel_j.raw(),
+      found.raw(),
+      with_covariances ? cloud.covs.raw() : nullptr,
+      with_normals ? cloud.normals.raw() : nullptr);
     SGC_CHECK(cudaGetLastError());
   }
+}
+
+}  // namespace
+
+void estimate_normals(GpuCloud& cloud, float leaf_size, int num_neighbors, int max_shell) {
+  estimate_features(cloud, leaf_size, num_neighbors, max_shell, false, true);
+}
+
+void estimate_covariances(GpuCloud& cloud, float leaf_size, int num_neighbors, int max_shell) {
+  estimate_features(cloud, leaf_size, num_neighbors, max_shell, true, false);
+}
+
+void estimate_normals_covariances(GpuCloud& cloud, float leaf_size, int num_neighbors, int max_shell) {
+  estimate_features(cloud, leaf_size, num_neighbors, max_shell, true, true);
 }
 
 }  // namespace sgc

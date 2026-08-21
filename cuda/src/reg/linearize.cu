@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <sgc/reg/reduction.hpp>
 
-#include <vector>
+#include <array>
 
 #include <sgc/core/check.hpp>
 #include <sgc/factor/gicp_math.cuh>
@@ -12,9 +12,31 @@ namespace sgc {
 
 namespace {
 
-constexpr int BLOCK = 256;
 constexpr int NUM_OUT = 43;  // H(36) + b(6) + e(1)
 
+// Finalize warp partials on the device. One thread owns one output element and sums
+// warp slots in their original order, preserving deterministic ordering while reducing
+// D2H traffic from O(num_warps * 43) to exactly 43 doubles.
+__global__ void reduce_partials_kernel(const double* partials, size_t num_warps, double* out) {
+  const int k = threadIdx.x;
+  if (k >= NUM_OUT) {
+    return;
+  }
+
+  double sum = 0.0;
+  for (size_t w = 0; w < num_warps; w++) {
+    sum += partials[w * NUM_OUT + k];
+  }
+  out[k] = sum;
+}
+
+__global__ void reduce_error_kernel(const double* partials, size_t num_warps, double* out) {
+  double sum = 0.0;
+  for (size_t w = 0; w < num_warps; w++) {
+    sum += partials[w * NUM_OUT + 42];
+  }
+  out[0] = sum;
+}
 
 // Warp-cooperative batch NN: one warp per source query. Phase 1 probes the 5^3 window with a
 // warp reduction; phase 2 (only when the best is worse than the expansion threshold) probes
@@ -41,8 +63,8 @@ __global__ void nn_batch_kernel(
   const float4 ps = queries[query];
   const float4* T4 = reinterpret_cast<const float4*>(T);
   const float4 r0 = T4[0], r1 = T4[1], r2 = T4[2];
-  const float4 q = make_float4(
-    r0.x * ps.x + r0.y * ps.y + r0.z * ps.z + r0.w, r1.x * ps.x + r1.y * ps.y + r1.z * ps.z + r1.w, r2.x * ps.x + r2.y * ps.y + r2.z * ps.z + r2.w, 1.0f);
+  const float4 q =
+    make_float4(r0.x * ps.x + r0.y * ps.y + r0.z * ps.z + r0.w, r1.x * ps.x + r1.y * ps.y + r1.z * ps.z + r1.w, r2.x * ps.x + r2.y * ps.y + r2.z * ps.z + r2.w, 1.0f);
   const unsigned long long qkey = voxel_key(q, inv_leaf);
   if (qkey == INVALID_KEY) {
     if (lane == 0) {
@@ -155,14 +177,59 @@ __global__ void nn_batch_kernel(
   }
 }
 
-// Fused per-point GICP linearization: transform -> NN -> mahalanobis -> H, b, e per point,
+template <RegistrationFactor Factor>
+__device__ __forceinline__ M3 factor_weight(const float4* target_normals, const float* target_covs, const float* source_covs, int target_index, int source_index, const M3& R) {
+  M3 M{};
+  if constexpr (Factor == RegistrationFactor::ICP) {
+    M.m[0] = 1.0f;
+    M.m[4] = 1.0f;
+    M.m[8] = 1.0f;
+  } else if constexpr (Factor == RegistrationFactor::PointToPlaneICP) {
+    const float4 n = target_normals[target_index];
+    // Match small_gicp::PointToPlaneICPFactor exactly:
+    // H = J^T diag(n)^2 J, b = J^T diag(n)^2 r.
+    M.m[0] = n.x * n.x;
+    M.m[4] = n.y * n.y;
+    M.m[8] = n.z * n.z;
+  } else {
+    // GICP: M = (Ct + R * Cs * R^T)^-1.
+    M3 Ct, Cs;
+#pragma unroll
+    for (int k = 0; k < 9; k++) {
+      Ct.m[k] = target_covs[target_index * 9 + k];
+      Cs.m[k] = source_covs[source_index * 9 + k];
+    }
+    M3 RCsRt;
+#pragma unroll
+    for (int r = 0; r < 3; r++) {
+#pragma unroll
+      for (int c = 0; c < 3; c++) {
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 3; k++) {
+          const float Rik = R.at(r, k);
+#pragma unroll
+          for (int l = 0; l < 3; l++) {
+            s += Rik * Cs.at(k, l) * R.at(c, l);
+          }
+        }
+        RCsRt.at(r, c) = s;
+      }
+    }
+    M = inv3(Ct + RCsRt);
+  }
+  return M;
+}
+
+// Fused per-point registration linearization: transform -> NN -> factor weight -> H, b, e,
 // then a deterministic warp shuffle reduction (fp32) with fp64 partials at lane 0.
-template <NNStrategy Strategy, bool ErrorOnly>
+template <RegistrationFactor Factor, NNStrategy Strategy, bool ErrorOnly>
 __global__ void linearize_kernel(
   HashIndexView hidx,
   const int* pre_j,
   const float* pre_d2,
   const float4* target_pts,
+  const float4* target_normals,
   const unsigned long long* target_keys,
   const float* target_covs,
   const float4* source_pts,
@@ -192,9 +259,11 @@ __global__ void linearize_kernel(
     const float4* T4 = reinterpret_cast<const float4*>(T);
     const float4 r0 = T4[0], r1 = T4[1], r2 = T4[2];
     // q = T * p_src
-    const V3 q{r0.x * ps.x + r0.y * ps.y + r0.z * ps.z + r0.w,  //
-               r1.x * ps.x + r1.y * ps.y + r1.z * ps.z + r1.w,  //
-               r2.x * ps.x + r2.y * ps.y + r2.z * ps.z + r2.w};
+    const V3 q{
+      r0.x * ps.x + r0.y * ps.y + r0.z * ps.z + r0.w,  //
+      r1.x * ps.x + r1.y * ps.y + r1.z * ps.z + r1.w,  //
+      r2.x * ps.x + r2.y * ps.y + r2.z * ps.z + r2.w};
+    const M3 R{r0.x, r0.y, r0.z, r1.x, r1.y, r1.z, r2.x, r2.y, r2.z};
 
     int j = -1;
 
@@ -202,10 +271,14 @@ __global__ void linearize_kernel(
       // Error re-evaluation with cached correspondences (no NN search)
       j = corr_target_idx[i];
       if (j >= 0) {
-        M3 M;
+        M3 M{};
+        if constexpr (Factor == RegistrationFactor::GICP) {
 #pragma unroll
-        for (int k = 0; k < 9; k++) {
-          M.m[k] = corr_mahalanobis[i * 9 + k];
+          for (int k = 0; k < 9; k++) {
+            M.m[k] = corr_mahalanobis[i * 9 + k];
+          }
+        } else {
+          M = factor_weight<Factor>(target_normals, nullptr, nullptr, j, i, R);
         }
         const float4 pt = target_pts[j];
         const V3 res{pt.x - q.x, pt.y - q.y, pt.z - q.z};
@@ -221,33 +294,7 @@ __global__ void linearize_kernel(
       }
 
       if (j >= 0 && d2 <= max_dist_sq) {
-        // M = (Ct + R * Cs * R^T)^-1
-        M3 Ct, Cs;
-#pragma unroll
-        for (int k = 0; k < 9; k++) {
-          Ct.m[k] = target_covs[j * 9 + k];
-          Cs.m[k] = source_covs[i * 9 + k];
-        }
-        const M3 R{r0.x, r0.y, r0.z, r1.x, r1.y, r1.z, r2.x, r2.y, r2.z};
-        M3 RCsRt;
-#pragma unroll
-        for (int r = 0; r < 3; r++) {
-#pragma unroll
-          for (int c = 0; c < 3; c++) {
-            float s = 0.0f;
-#pragma unroll
-            for (int k = 0; k < 3; k++) {
-              const float Rik = R.at(r, k);
-#pragma unroll
-              for (int l = 0; l < 3; l++) {
-                s += Rik * Cs.at(k, l) * R.at(c, l);
-              }
-            }
-            RCsRt.at(r, c) = s;
-          }
-        }
-
-        const M3 M = inv3(Ct + RCsRt);
+        const M3 M = factor_weight<Factor>(target_normals, target_covs, source_covs, j, i, R);
 
         const float4 pt = target_pts[j];
         const V3 res{pt.x - q.x, pt.y - q.y, pt.z - q.z};
@@ -299,9 +346,11 @@ __global__ void linearize_kernel(
         acc[42] = 0.5f * dot(res, Mr);
 
         corr_target_idx[i] = j;
+        if constexpr (Factor == RegistrationFactor::GICP) {
 #pragma unroll
-        for (int k = 0; k < 9; k++) {
-          corr_mahalanobis[i * 9 + k] = M.m[k];
+          for (int k = 0; k < 9; k++) {
+            corr_mahalanobis[i * 9 + k] = M.m[k];
+          }
         }
         inlier = true;
       } else {
@@ -347,6 +396,12 @@ void Linearizer::prepare(size_t num_source) {
   if (inlier_count_.size() != 1) {
     inlier_count_.resize(1);
   }
+  if (reduced_out_.size() != NUM_OUT) {
+    reduced_out_.resize(NUM_OUT);
+  }
+  if (error_out_.size() != 1) {
+    error_out_.resize(1);
+  }
   if (nn_j_.size() != static_cast<size_t>(num_source)) {
     nn_j_.resize(num_source);
     nn_d2_.resize(num_source);
@@ -356,7 +411,7 @@ void Linearizer::prepare(size_t num_source) {
 namespace {
 
 void upload_T(GpuBuffer<float>& d_T, const Eigen::Isometry3d& T) {
-  std::vector<float> h_T(16);
+  std::array<float, 16> h_T;
   const Eigen::Matrix4f Tf = T.matrix().cast<float>();
   for (int r = 0; r < 4; r++) {
     for (int c = 0; c < 4; c++) {
@@ -364,6 +419,125 @@ void upload_T(GpuBuffer<float>& d_T, const Eigen::Isometry3d& T) {
     }
   }
   d_T.upload(h_T.data(), 16);
+}
+
+template <RegistrationFactor Factor, NNStrategy Strategy, bool ErrorOnly>
+void launch_factor_kernel(
+  int grid,
+  int block,
+  HashIndexView hidx,
+  const int* pre_j,
+  const float* pre_d2,
+  const GpuCloud& target,
+  const GpuCloud& source,
+  int num_source,
+  int num_target,
+  const float* d_T,
+  float max_dist_sq,
+  float inv_leaf,
+  double* partials,
+  unsigned int* inlier_count,
+  int* corr_target_idx,
+  float* corr_mahalanobis) {
+  linearize_kernel<Factor, Strategy, ErrorOnly><<<grid, block>>>(
+    hidx,
+    pre_j,
+    pre_d2,
+    target.points.raw(),
+    target.normals.raw(),
+    target.keys.raw(),
+    target.covs.raw(),
+    source.points.raw(),
+    source.covs.raw(),
+    num_source,
+    num_target,
+    d_T,
+    max_dist_sq,
+    inv_leaf,
+    partials,
+    inlier_count,
+    corr_target_idx,
+    corr_mahalanobis);
+}
+
+template <RegistrationFactor Factor, bool ErrorOnly>
+void launch_factor(
+  NNStrategy nn,
+  int grid,
+  int block,
+  HashIndexView hidx,
+  const int* pre_j,
+  const float* pre_d2,
+  const GpuCloud& target,
+  const GpuCloud& source,
+  int num_source,
+  int num_target,
+  const float* d_T,
+  float max_dist_sq,
+  float inv_leaf,
+  double* partials,
+  unsigned int* inlier_count,
+  int* corr_target_idx,
+  float* corr_mahalanobis) {
+  switch (nn) {
+    case NNStrategy::Voxel3:
+      launch_factor_kernel<Factor, NNStrategy::Voxel3, ErrorOnly>(
+        grid,
+        block,
+        hidx,
+        pre_j,
+        pre_d2,
+        target,
+        source,
+        num_source,
+        num_target,
+        d_T,
+        max_dist_sq,
+        inv_leaf,
+        partials,
+        inlier_count,
+        corr_target_idx,
+        corr_mahalanobis);
+      break;
+    case NNStrategy::Voxel5:
+      launch_factor_kernel<Factor, NNStrategy::Voxel5, ErrorOnly>(
+        grid,
+        block,
+        hidx,
+        pre_j,
+        pre_d2,
+        target,
+        source,
+        num_source,
+        num_target,
+        d_T,
+        max_dist_sq,
+        inv_leaf,
+        partials,
+        inlier_count,
+        corr_target_idx,
+        corr_mahalanobis);
+      break;
+    case NNStrategy::ExactBF:
+      launch_factor_kernel<Factor, NNStrategy::ExactBF, ErrorOnly>(
+        grid,
+        block,
+        hidx,
+        pre_j,
+        pre_d2,
+        target,
+        source,
+        num_source,
+        num_target,
+        d_T,
+        max_dist_sq,
+        inv_leaf,
+        partials,
+        inlier_count,
+        corr_target_idx,
+        corr_mahalanobis);
+      break;
+  }
 }
 
 }  // namespace
@@ -375,6 +549,7 @@ size_t Linearizer::linearize_and_reduce(
   double max_dist_sq,
   NNStrategy nn,
   float leaf_size,
+  RegistrationFactor factor,
   CorrCache& cache,
   double* h_out) {
   const int num_source = static_cast<int>(source.size());
@@ -387,7 +562,7 @@ size_t Linearizer::linearize_and_reduce(
   }
 
   prepare(num_source);
-  cache.resize(num_source);
+  cache.resize(num_source, factor == RegistrationFactor::GICP);
   upload_T(d_T_, T);
 
   unsigned int zero = 0;
@@ -404,41 +579,103 @@ size_t Linearizer::linearize_and_reduce(
     constexpr int NN_BLOCK = 256;
     const int nn_grid = (num_source + 7) / 8;
     nn_batch_kernel<<<nn_grid, NN_BLOCK>>>(
-      hidx, target.keys.raw(), num_target, target.points.raw(), source.points.raw(), num_source, d_T_.raw(), inv_leaf, max_dist_sq, nn_j_.raw(), nn_d2_.raw());
+      hidx,
+      target.keys.raw(),
+      num_target,
+      target.points.raw(),
+      source.points.raw(),
+      num_source,
+      d_T_.raw(),
+      inv_leaf,
+      max_dist_sq,
+      nn_j_.raw(),
+      nn_d2_.raw());
     SGC_CHECK(cudaGetLastError());
     pre_j = nn_j_.raw();
     pre_d2 = nn_d2_.raw();
   }
 
-  switch (nn) {
-    case NNStrategy::Voxel3:
-      linearize_kernel<NNStrategy::Voxel3, false><<<grid, block_>>>(
-        hidx, pre_j, pre_d2, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
-        inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
+  switch (factor) {
+    case RegistrationFactor::ICP:
+      launch_factor<RegistrationFactor::ICP, false>(
+        nn,
+        grid,
+        block_,
+        hidx,
+        pre_j,
+        pre_d2,
+        target,
+        source,
+        num_source,
+        num_target,
+        d_T_.raw(),
+        max_dist_sq,
+        inv_leaf,
+        partials_.raw(),
+        inlier_count_.raw(),
+        cache.target_idx.raw(),
+        nullptr);
       break;
-    case NNStrategy::Voxel5:
-      linearize_kernel<NNStrategy::Voxel5, false><<<grid, block_>>>(
-        hidx, pre_j, pre_d2, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
-        inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
+    case RegistrationFactor::PointToPlaneICP:
+      launch_factor<RegistrationFactor::PointToPlaneICP, false>(
+        nn,
+        grid,
+        block_,
+        hidx,
+        pre_j,
+        pre_d2,
+        target,
+        source,
+        num_source,
+        num_target,
+        d_T_.raw(),
+        max_dist_sq,
+        inv_leaf,
+        partials_.raw(),
+        inlier_count_.raw(),
+        cache.target_idx.raw(),
+        nullptr);
       break;
-    case NNStrategy::ExactBF:
-      linearize_kernel<NNStrategy::ExactBF, false><<<grid, block_>>>(
-        hidx, nullptr, nullptr, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, num_target, d_T_.raw(), max_dist_sq,
-        inv_leaf, partials_.raw(), inlier_count_.raw(), cache.target_idx.raw(), cache.mahalanobis.raw());
+    case RegistrationFactor::GICP:
+      launch_factor<RegistrationFactor::GICP, false>(
+        nn,
+        grid,
+        block_,
+        hidx,
+        pre_j,
+        pre_d2,
+        target,
+        source,
+        num_source,
+        num_target,
+        d_T_.raw(),
+        max_dist_sq,
+        inv_leaf,
+        partials_.raw(),
+        inlier_count_.raw(),
+        cache.target_idx.raw(),
+        cache.mahalanobis.raw());
       break;
   }
   SGC_CHECK(cudaGetLastError());
 
-  std::vector<double> h_partials(num_warps_ * NUM_OUT);
-  partials_.download(h_partials.data(), h_partials.size());
-
-  for (int k = 0; k < NUM_OUT; k++) {
-    h_out[k] = 0.0;
-  }
-  for (size_t w = 0; w < num_warps_; w++) {
+  if (factor == RegistrationFactor::ICP) {
+    // On Jetson, lightweight ICP finishes faster without an extra final-reduction launch.
+    // Retain and reuse the host staging vector so this path does not allocate per iteration.
+    host_partials_.resize(num_warps_ * NUM_OUT);
+    partials_.download(host_partials_.data(), host_partials_.size());
     for (int k = 0; k < NUM_OUT; k++) {
-      h_out[k] += h_partials[w * NUM_OUT + k];
+      h_out[k] = 0.0;
     }
+    for (size_t w = 0; w < num_warps_; w++) {
+      for (int k = 0; k < NUM_OUT; k++) {
+        h_out[k] += host_partials_[w * NUM_OUT + k];
+      }
+    }
+  } else {
+    reduce_partials_kernel<<<1, 64>>>(partials_.raw(), num_warps_, reduced_out_.raw());
+    SGC_CHECK(cudaGetLastError());
+    reduced_out_.download(h_out, NUM_OUT);
   }
   // Symmetrize H from the upper triangle
   for (int r = 0; r < 6; r++) {
@@ -452,7 +689,7 @@ size_t Linearizer::linearize_and_reduce(
   return inliers;
 }
 
-double Linearizer::eval_error_cached(const GpuCloud& target, const GpuCloud& source, const Eigen::Isometry3d& T, const CorrCache& cache) {
+double Linearizer::eval_error_cached(const GpuCloud& target, const GpuCloud& source, const Eigen::Isometry3d& T, RegistrationFactor factor, const CorrCache& cache) {
   const int num_source = static_cast<int>(source.size());
   if (num_source == 0) {
     return 0.0;
@@ -463,17 +700,81 @@ double Linearizer::eval_error_cached(const GpuCloud& target, const GpuCloud& sou
 
   const int grid = (num_source + block_ - 1) / block_;
   const HashIndexView hidx = target.index.view();
-  linearize_kernel<NNStrategy::Voxel3, true><<<grid, block_>>>(
-    hidx, nullptr, nullptr, target.points.raw(), target.keys.raw(), target.covs.raw(), source.points.raw(), source.covs.raw(), num_source, 0, d_T_.raw(), 0.0f, 0.0f, partials_.raw(),
-    inlier_count_.raw(), const_cast<int*>(cache.target_idx.raw()), const_cast<float*>(cache.mahalanobis.raw()));
+  switch (factor) {
+    case RegistrationFactor::ICP:
+      launch_factor<RegistrationFactor::ICP, true>(
+        NNStrategy::Voxel3,
+        grid,
+        block_,
+        hidx,
+        nullptr,
+        nullptr,
+        target,
+        source,
+        num_source,
+        0,
+        d_T_.raw(),
+        0.0f,
+        0.0f,
+        partials_.raw(),
+        inlier_count_.raw(),
+        const_cast<int*>(cache.target_idx.raw()),
+        nullptr);
+      break;
+    case RegistrationFactor::PointToPlaneICP:
+      launch_factor<RegistrationFactor::PointToPlaneICP, true>(
+        NNStrategy::Voxel3,
+        grid,
+        block_,
+        hidx,
+        nullptr,
+        nullptr,
+        target,
+        source,
+        num_source,
+        0,
+        d_T_.raw(),
+        0.0f,
+        0.0f,
+        partials_.raw(),
+        inlier_count_.raw(),
+        const_cast<int*>(cache.target_idx.raw()),
+        nullptr);
+      break;
+    case RegistrationFactor::GICP:
+      launch_factor<RegistrationFactor::GICP, true>(
+        NNStrategy::Voxel3,
+        grid,
+        block_,
+        hidx,
+        nullptr,
+        nullptr,
+        target,
+        source,
+        num_source,
+        0,
+        d_T_.raw(),
+        0.0f,
+        0.0f,
+        partials_.raw(),
+        inlier_count_.raw(),
+        const_cast<int*>(cache.target_idx.raw()),
+        const_cast<float*>(cache.mahalanobis.raw()));
+      break;
+  }
   SGC_CHECK(cudaGetLastError());
 
-  std::vector<double> h_partials(num_warps_ * NUM_OUT);
-  partials_.download(h_partials.data(), h_partials.size());
-
   double e = 0.0;
-  for (size_t w = 0; w < num_warps_; w++) {
-    e += h_partials[w * NUM_OUT + 42];
+  if (factor == RegistrationFactor::ICP) {
+    host_partials_.resize(num_warps_ * NUM_OUT);
+    partials_.download(host_partials_.data(), host_partials_.size());
+    for (size_t w = 0; w < num_warps_; w++) {
+      e += host_partials_[w * NUM_OUT + 42];
+    }
+  } else {
+    reduce_error_kernel<<<1, 1>>>(partials_.raw(), num_warps_, error_out_.raw());
+    SGC_CHECK(cudaGetLastError());
+    error_out_.download(&e, 1);
   }
   return e;
 }

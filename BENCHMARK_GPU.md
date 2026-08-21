@@ -23,6 +23,30 @@ Acceptance gate (APE/RPE within 5% of upstream): **PASS for both engines**. Data
 directly from the official `avg-kitti` S3 zip (`scripts/fetch_kitti00_range.py`); the Google Drive
 subset referenced by upstream BENCHMARK.md is dead (404).
 
+### All ICP-family engines (current branch, 100-frame KITTI-00)
+
+Current validation host (2026-08-21): RTX 4070 Ti SUPER (sm_89), Ryzen 9 9950X
+(16C/32T), CUDA 12.4. Each cell is the median of five independent run-level p50 values;
+frame zero primes the target/context and is excluded. CPU runs use OpenMP with
+`OMP_WAIT_POLICY=ACTIVE` inside the same `taskset -c 0-31` affinity set.
+
+| engine (scan-to-scan) | sgc CUDA | small_gicp OMP 8 | OMP 16 | OMP 32 | CUDA speedup vs OMP 32 |
+|---|---:|---:|---:|---:|---:|
+| ICP | **4.894 ms** | 12.698 | 12.032 | 10.262 | **2.10x** |
+| Point-to-Plane ICP | **6.417 ms** | 10.063 | 8.632 | 7.394 | **1.15x** |
+| GICP | **5.892 ms** | 9.082 | 7.731 | 6.976 | **1.18x** |
+| VGICP | **6.439 ms** | 8.707 | 8.479 | 8.079 | **1.25x** |
+
+GPU-vs-OMP32 trajectory differences over 100 frames remain bounded: ICP max translation
+0.2 mm / rotation 0.003 deg; Point-to-Plane 3.6 cm / 0.087 deg; GICP 2.7 cm / 0.071 deg;
+VGICP 3.3 cm / 0.094 deg.
+
+For the external CUDA comparison, only VGICP is common: with both CUDA implementations built
+using CUDA 11.8/GCC 11 and the same scan-to-scan policy, sgc is **6.392 ms p50 / 7.838 ms p95**
+versus `fast_gicp::FastVGICPCuda` default at **9.116 / 11.625 ms** (sgc **1.43x** faster by p50).
+`FastVGICPCuda` is the only ICP-family CUDA engine in upstream fast_gicp; it has no CUDA GICP,
+ICP, or Point-to-Plane counterpart.
+
 ### Full sequence 00 (all 4541 frames, official S3 data + GT poses)
 
 The complete 3.7 km loop, chained frame-to-frame odometry, no loop closure — the long-horizon
@@ -52,21 +76,30 @@ Full-sequence extras:
 - NN strategy on the full sequence (GICP p50): voxel3 5.96, voxel5 (default) 6.00, exact-bf 13.11
   msec/frame — same ordering and ratios as the 100-frame ablation.
 
-### Jetson Orin NX (target device, MAXN mode, CUDA 12.2, on-device build sm_87)
+### Jetson Orin (12-core live-load device, MAXN + locked clocks, CUDA 12.2, sm_87)
 
-Same 100-frame official KITTI-00 protocol, on-device build, 20/20 parity tests passing on the
-Orin GPU. Cross-device determinism: GPU trajectories are bit-identical to the x86 GPU runs
-(APE = 0.0000 m across sm_87 vs sm_89 for both engines).
+Same KITTI-00 100-frame input, with MPCC, LIO, YOLO, PointPillar, RViz, Xorg, and the ROS
+stack deliberately left running. Each value is the median of ten run-level p50 values in a
+rotated-order block design; no slow run is removed. Device validation is 32/32 tests plus
+Compute Sanitizer zero errors.
 
-| engine | exec | p50 [msec/frame] | speedup | fps | GPU vs CPU (on Orin) |
-|---|---|---|---|---|---|
-| GICP  | cpu (upstream serial) | 118.3 | 1.0x | 8.2 | reference |
-| GICP  | full-gpu | **16.5** | **7.2x** | 56 | APE 1.2 cm / 100 f |
-| VGICP | cpu (upstream serial) | 102.3 | 1.0x | 9.5 | reference |
-| VGICP | full-gpu | **14.2** | **7.2x** | 63 | APE 0.2 cm / 100 f |
+| engine | small_gicp 12T | small_gicp 8T | CUDA quality12 | CUDA balanced8 | quality/balanced speedup vs 8T |
+|---|---:|---:|---:|---:|---:|
+| ICP | 101.34 | 43.25 | **23.85** | same | **1.89x** |
+| Point-to-Plane ICP | 67.59 | 31.85 | **29.48** | **22.18** | **1.15x / 1.50x** |
+| GICP | 57.02 | 27.80 | **26.03** | **18.11** | **1.10x / 1.55x** |
+| VGICP scan-to-model | 58.24 | 33.72 | **23.16** | **15.97** | **1.52x / 2.18x** |
+| VGICP scan-to-scan | 52.38 | 27.10 | **22.79** | **15.84** | **1.22x / 1.73x** |
 
-Note: the Orin CPU baseline is 2.7x slower than the desktop Ryzen (as expected for A78AE);
-clocks were at MAXN but not pinned (`jetson_clocks` needs sudo on the test unit).
+Units are msec/frame. `quality12` retains the original covariance shell cap. `balanced8`
+is an explicit Jetson preprocessing profile (`--cov_max_shell 8`) and is never substituted
+silently. Relative to quality12, its maximum 100-frame differences are 1.35-3.37 cm and
+0.034-0.058 degrees across the covariance-dependent engines; these are implementation
+differences, not KITTI ground-truth error.
+
+FastVGICPCuda default (CPU parallel KD-tree + GPU VGICP) measured 42.87 ms p50 in the same
+ten scan-to-scan blocks. Project quality12/balanced8 are **1.98x/2.83x faster**. Full Jetson
+methodology, Nsight evidence, and commands are in `JETSON.md`.
 
 ### 60-frame real LiDAR sequence (KITTI object3d training, consecutive frames 0-59)
 
@@ -94,12 +127,13 @@ Per-frame difference vs upstream: **100% of frames within 1 cm / 0.3 deg** for b
 | KITTI 5->6 | 9.3 mm | 0.005 deg |
 | KITTI 6->7 | 8.2 mm | 0.002 deg |
 
-## Kernel-level parity (unit tests, 20/20 passing)
+## Kernel-level parity (unit tests, 32/32 passing on desktop and Jetson)
 
 - Downsampling: bucket set + centroids identical to upstream (`1e-4` m).
 - Covariance: exact kNN-20 via warp-cooperative shells + early-stop bound; median rel. error `1e-4`, p99 `<1e-3` vs upstream double.
+- Normals: the same kNN/eigendecomposition path reproduces upstream plane normals up to the mathematically arbitrary eigenvector sign.
 - NN strategies: `exact-bf` identical to kd-tree; `voxel5+adaptive expansion` identical end-to-end to `exact-bf`.
-- Linearization: H/b/e within `1e-3` of the upstream double reference; bit-identical across 100 runs (deterministic reduction).
+- Linearization: ICP, Point-to-Plane ICP, and GICP H/b/e within `1e-3`–`2e-3` of the upstream double reference; bit-identical across 100 runs (deterministic reduction).
 - Voxel map: per-voxel mean/cov/count parity with upstream `GaussianVoxelMap`; deterministic across runs.
 - `compute-sanitizer memcheck`: 0 errors.
 
@@ -164,7 +198,7 @@ far weaker — the GPU advantage holds against upstream's best CPU configuration
 
 ```bash
 cmake -B build_cuda -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build_cuda -j
-ctest --test-dir build_cuda           # 20 kernel-parity tests
+ctest --test-dir build_cuda           # 32 kernel-parity tests
 ./build_cuda/cuda/odometry_gpu <velodyne_dir> --exec full-gpu --engine gicp
 ./build_cuda/cuda/odometry_gpu <velodyne_dir> --exec full-gpu --engine gicp --max_frames 4541 --traj /tmp/gpu.txt
 ./build_cuda/cuda/odometry_gpu <velodyne_dir> --exec cpu --engine gicp --max_frames 4541 --traj /tmp/cpu.txt

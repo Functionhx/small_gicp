@@ -11,6 +11,8 @@
 
 #include <small_gicp/ann/kdtree.hpp>
 #include <small_gicp/factors/gicp_factor.hpp>
+#include <small_gicp/factors/icp_factor.hpp>
+#include <small_gicp/factors/plane_icp_factor.hpp>
 #include <small_gicp/points/eigen.hpp>
 #include <small_gicp/points/point_cloud.hpp>
 #include <small_gicp/registration/rejector.hpp>
@@ -20,6 +22,7 @@
 namespace {
 
 // Upstream reference: sum of per-point H/b/e over the source cloud (double precision).
+template <typename Factor>
 void reference_sum(
   const small_gicp::PointCloud& target,
   const small_gicp::PointCloud& source,
@@ -34,12 +37,12 @@ void reference_sum(
   e = 0.0;
   inliers = 0;
 
-  small_gicp::GICPFactor::Setting setting;
+  typename Factor::Setting setting;
   small_gicp::DistanceRejector rejector;
   rejector.max_dist_sq = 1.0;
 
   for (size_t i = 0; i < source.size(); i++) {
-    small_gicp::GICPFactor factor(setting);
+    Factor factor(setting);
     Eigen::Matrix<double, 6, 6> h;
     Eigen::Matrix<double, 6, 1> bb;
     double ee;
@@ -90,14 +93,14 @@ protected:
     }
     tree = std::make_unique<small_gicp::UnsafeKdTree<small_gicp::PointCloud>>(*ref_target);
 
-    reference_sum(*ref_target, *ref_source, *tree, T, ref_H, ref_b, ref_e, ref_inliers);
+    reference_sum<small_gicp::GICPFactor>(*ref_target, *ref_source, *tree, T, ref_H, ref_b, ref_e, ref_inliers);
   }
 
   void check_parity(sgc::NNStrategy strategy, double h_tol, double b_tol, double e_tol, double inlier_tol) {
     sgc::Linearizer linearizer;
     sgc::CorrCache cache;
     std::vector<double> out(43);
-    const size_t inliers = linearizer.linearize_and_reduce(gpu_target, gpu_source, T, 1.0, strategy, 0.25f, cache, out.data());
+    const size_t inliers = linearizer.linearize_and_reduce(gpu_target, gpu_source, T, 1.0, strategy, 0.25f, sgc::RegistrationFactor::GICP, cache, out.data());
 
     Eigen::Matrix<double, 6, 6> H;
     Eigen::Matrix<double, 6, 1> b;
@@ -115,8 +118,40 @@ protected:
     EXPECT_NEAR(static_cast<double>(inliers) / ref_inliers, 1.0, inlier_tol);
 
     // Self-consistency: the cached-correspondence error at the same T must equal the linearized e
-    const double e_cached = linearizer.eval_error_cached(gpu_target, gpu_source, T, cache);
+    const double e_cached = linearizer.eval_error_cached(gpu_target, gpu_source, T, sgc::RegistrationFactor::GICP, cache);
     EXPECT_LT(std::abs(e_cached - e) / std::abs(e), 1e-6);
+  }
+
+  template <typename Factor>
+  void check_factor_parity(sgc::RegistrationFactor factor, double tolerance) {
+    Eigen::Matrix<double, 6, 6> expected_H;
+    Eigen::Matrix<double, 6, 1> expected_b;
+    double expected_e = 0.0;
+    size_t expected_inliers = 0;
+    reference_sum<Factor>(*ref_target, *ref_source, *tree, T, expected_H, expected_b, expected_e, expected_inliers);
+
+    sgc::Linearizer linearizer;
+    sgc::CorrCache cache;
+    std::vector<double> out(43);
+    const size_t inliers = linearizer.linearize_and_reduce(gpu_target, gpu_source, T, 1.0, sgc::NNStrategy::ExactBF, 0.25f, factor, cache, out.data());
+
+    Eigen::Matrix<double, 6, 6> H;
+    Eigen::Matrix<double, 6, 1> b;
+    for (int r = 0; r < 6; r++) {
+      for (int c = 0; c < 6; c++) {
+        H(r, c) = out[r * 6 + c];
+      }
+      b(r) = out[36 + r];
+    }
+    const double e = out[42];
+
+    EXPECT_LT((H - expected_H).norm() / expected_H.norm(), tolerance);
+    EXPECT_LT((b - expected_b).norm() / expected_b.norm(), tolerance);
+    EXPECT_LT(std::abs(e - expected_e) / std::abs(expected_e), tolerance);
+    EXPECT_NEAR(static_cast<double>(inliers) / expected_inliers, 1.0, 1e-3);
+
+    const double cached = linearizer.eval_error_cached(gpu_target, gpu_source, T, factor, cache);
+    EXPECT_LT(std::abs(cached - e) / std::abs(e), 1e-6);
   }
 
   std::vector<Eigen::Vector4f> raw;
@@ -138,13 +173,23 @@ TEST_F(LinearizeTest, HbEParityVoxel5) {
   check_parity(sgc::NNStrategy::Voxel5, 5e-3, 5e-3, 5e-3, 5e-3);
 }
 
+TEST_F(LinearizeTest, PointToPointHbEParityExactBF) {
+  check_factor_parity<small_gicp::ICPFactor>(sgc::RegistrationFactor::ICP, 1e-3);
+}
+
+TEST_F(LinearizeTest, PointToPlaneHbEParityExactBF) {
+  small_gicp::estimate_normals(*ref_target, *tree, 20);
+  sgc::estimate_normals(gpu_target, 0.25f, 20);
+  check_factor_parity<small_gicp::PointToPlaneICPFactor>(sgc::RegistrationFactor::PointToPlaneICP, 2e-3);
+}
+
 TEST_F(LinearizeTest, DeterministicAcrossRuns) {
   sgc::Linearizer linearizer;
   sgc::CorrCache cache;
   std::vector<double> first(43), again(43);
-  linearizer.linearize_and_reduce(gpu_target, gpu_source, T, 1.0, sgc::NNStrategy::Voxel5, 0.25f, cache, first.data());
+  linearizer.linearize_and_reduce(gpu_target, gpu_source, T, 1.0, sgc::NNStrategy::Voxel5, 0.25f, sgc::RegistrationFactor::GICP, cache, first.data());
   for (int r = 0; r < 100; r++) {
-    linearizer.linearize_and_reduce(gpu_target, gpu_source, T, 1.0, sgc::NNStrategy::Voxel5, 0.25f, cache, again.data());
+    linearizer.linearize_and_reduce(gpu_target, gpu_source, T, 1.0, sgc::NNStrategy::Voxel5, 0.25f, sgc::RegistrationFactor::GICP, cache, again.data());
     ASSERT_EQ(again, first);
   }
 }

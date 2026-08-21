@@ -34,6 +34,8 @@ protected:
   // Scratch buffers
   GpuBuffer<float> d_T_;
   GpuBuffer<double> partials_;
+  GpuBuffer<double> reduced_out_;
+  GpuBuffer<double> error_out_;
   GpuBuffer<unsigned int> inlier_count_;
   size_t num_warps_ = 0;
   CorrCache cache_;

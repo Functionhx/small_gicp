@@ -14,6 +14,10 @@ namespace sgc {
 ///        used by the NN search strategies. Deterministic: fixed launch config + fp64 reduction.
 class Downsampler {
 public:
+  /// @brief Recycle the previous raw-input and output allocations into cloud before upload.
+  ///        Call before replacing cloud with the next host frame.
+  void prepare_input(GpuCloud& cloud);
+
   /// @brief Downsample cloud.points in place (replaced by sorted voxel centroids) and fill cloud.keys.
   /// @param cloud     [in/out] Cloud whose points buffer holds num_raw raw points
   /// @param num_raw   Number of raw input points in cloud.points

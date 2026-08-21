@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <sgc/reg/vgicp.hpp>
 
-#include <vector>
+#include <array>
 
 #include <sgc/core/check.hpp>
 #include <sgc/factor/gicp_math.cuh>
@@ -15,6 +15,27 @@ namespace {
 constexpr int BLOCK = 256;
 constexpr int NUM_OUT = 43;
 constexpr unsigned long long EMPTY = 0xFFFFFFFFFFFFFFFFull;
+
+__global__ void reduce_partials_kernel(const double* partials, size_t num_warps, double* out) {
+  const int k = threadIdx.x;
+  if (k >= NUM_OUT) {
+    return;
+  }
+
+  double sum = 0.0;
+  for (size_t w = 0; w < num_warps; w++) {
+    sum += partials[w * NUM_OUT + k];
+  }
+  out[k] = sum;
+}
+
+__global__ void reduce_error_kernel(const double* partials, size_t num_warps, double* out) {
+  double sum = 0.0;
+  for (size_t w = 0; w < num_warps; w++) {
+    sum += partials[w * NUM_OUT + 42];
+  }
+  out[0] = sum;
+}
 
 // Fused per-point VGICP linearization against the incremental voxel map:
 // center-voxel probe -> mahalanobis -> H, b, e; deterministic warp reduction as in Linearizer.
@@ -50,9 +71,10 @@ __global__ void vgicp_linearize_kernel(
     const float4 ps = source_pts[i];
     const float4* T4 = reinterpret_cast<const float4*>(T);
     const float4 r0 = T4[0], r1 = T4[1], r2 = T4[2];
-    const V3 q{r0.x * ps.x + r0.y * ps.y + r0.z * ps.z + r0.w,  //
-               r1.x * ps.x + r1.y * ps.y + r1.z * ps.z + r1.w,  //
-               r2.x * ps.x + r2.y * ps.y + r2.z * ps.z + r2.w};
+    const V3 q{
+      r0.x * ps.x + r0.y * ps.y + r0.z * ps.z + r0.w,  //
+      r1.x * ps.x + r1.y * ps.y + r1.z * ps.z + r1.w,  //
+      r2.x * ps.x + r2.y * ps.y + r2.z * ps.z + r2.w};
 
     int slot = -1;
 
@@ -196,7 +218,7 @@ __global__ void vgicp_linearize_kernel(
 }
 
 void upload_T(GpuBuffer<float>& d_T, const Eigen::Isometry3d& T) {
-  std::vector<float> h_T(16);
+  std::array<float, 16> h_T;
   const Eigen::Matrix4f Tf = T.matrix().cast<float>();
   for (int r = 0; r < 4; r++) {
     for (int c = 0; c < 4; c++) {
@@ -231,15 +253,18 @@ GicpResult VgicpGpu::align(const VoxelHashMap& map, const GpuCloud& source, cons
   if (inlier_count_.size() != 1) {
     inlier_count_.resize(1);
   }
-  cache_.resize(num_source);
-  {  // Initialize the correspondence cache so that any unwritten slot reads as "no correspondence"
-    std::vector<int> neg(num_source, -1);
-    cache_.target_idx.upload(neg.data(), num_source);
+  if (reduced_out_.size() != NUM_OUT) {
+    reduced_out_.resize(NUM_OUT);
   }
+  if (error_out_.size() != 1) {
+    error_out_.resize(1);
+  }
+  cache_.resize(num_source, true);
+  // Initialize the correspondence cache on-device so any unwritten slot reads as no match.
+  SGC_CHECK(cudaMemsetAsync(cache_.target_idx.raw(), 0xFF, static_cast<size_t>(num_source) * sizeof(int)));
 
   const float inv_leaf = 1.0f / static_cast<float>(map.leaf_size());
-  std::vector<double> h_partials(num_warps * NUM_OUT);
-  std::vector<double> out(43, 0.0);
+  std::array<double, NUM_OUT> out{};
 
   for (int i = 0; i < max_iterations && !result.converged; i++) {
     upload_T(d_T_, result.T_target_source);
@@ -247,19 +272,26 @@ GicpResult VgicpGpu::align(const VoxelHashMap& map, const GpuCloud& source, cons
     inlier_count_.upload(&zero, 1);
 
     vgicp_linearize_kernel<false><<<grid, BLOCK>>>(
-      map.mask(), map.table_key.raw(), map.table_slot.raw(), map.mean.raw(), map.cov.raw(), inv_leaf, source.points.raw(), source.covs.raw(), num_source, d_T_.raw(), max_dist_sq,
-      partials_.raw(), inlier_count_.raw(), cache_.target_idx.raw(), cache_.mahalanobis.raw());
+      map.mask(),
+      map.table_key.raw(),
+      map.table_slot.raw(),
+      map.mean.raw(),
+      map.cov.raw(),
+      inv_leaf,
+      source.points.raw(),
+      source.covs.raw(),
+      num_source,
+      d_T_.raw(),
+      max_dist_sq,
+      partials_.raw(),
+      inlier_count_.raw(),
+      cache_.target_idx.raw(),
+      cache_.mahalanobis.raw());
     SGC_CHECK(cudaGetLastError());
 
-    partials_.download(h_partials.data(), h_partials.size());
-    for (int k = 0; k < NUM_OUT; k++) {
-      out[k] = 0.0;
-    }
-    for (size_t w = 0; w < num_warps; w++) {
-      for (int k = 0; k < NUM_OUT; k++) {
-        out[k] += h_partials[w * NUM_OUT + k];
-      }
-    }
+    reduce_partials_kernel<<<1, 64>>>(partials_.raw(), num_warps, reduced_out_.raw());
+    SGC_CHECK(cudaGetLastError());
+    reduced_out_.download(out.data(), NUM_OUT);
     for (int r = 0; r < 6; r++) {
       for (int c = 0; c < r; c++) {
         out[r * 6 + c] = out[c * 6 + r];
@@ -278,7 +310,6 @@ GicpResult VgicpGpu::align(const VoxelHashMap& map, const GpuCloud& source, cons
     }
     const double e = out[42];
 
-
     bool success = false;
     for (int j = 0; j < max_inner_iterations; j++) {
       const Eigen::Matrix<double, 6, 1> delta = (H + lambda * Eigen::Matrix<double, 6, 6>::Identity()).ldlt().solve(-b);
@@ -286,15 +317,27 @@ GicpResult VgicpGpu::align(const VoxelHashMap& map, const GpuCloud& source, cons
       const Eigen::Isometry3d new_T = result.T_target_source * se3_exp(delta);
       upload_T(d_T_, new_T);
       vgicp_linearize_kernel<true><<<grid, BLOCK>>>(
-        map.mask(), map.table_key.raw(), map.table_slot.raw(), map.mean.raw(), map.cov.raw(), inv_leaf, source.points.raw(), source.covs.raw(), num_source, d_T_.raw(), 0.0f, partials_.raw(),
-        inlier_count_.raw(), cache_.target_idx.raw(), cache_.mahalanobis.raw());
+        map.mask(),
+        map.table_key.raw(),
+        map.table_slot.raw(),
+        map.mean.raw(),
+        map.cov.raw(),
+        inv_leaf,
+        source.points.raw(),
+        source.covs.raw(),
+        num_source,
+        d_T_.raw(),
+        0.0f,
+        partials_.raw(),
+        inlier_count_.raw(),
+        cache_.target_idx.raw(),
+        cache_.mahalanobis.raw());
       SGC_CHECK(cudaGetLastError());
 
-      partials_.download(h_partials.data(), h_partials.size());
+      reduce_error_kernel<<<1, 1>>>(partials_.raw(), num_warps, error_out_.raw());
+      SGC_CHECK(cudaGetLastError());
       double new_e = 0.0;
-      for (size_t w = 0; w < num_warps; w++) {
-        new_e += h_partials[w * NUM_OUT + 42];
-      }
+      error_out_.download(&new_e, 1);
 
       if (new_e <= e) {
         result.converged = converged(delta);

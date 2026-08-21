@@ -1,6 +1,6 @@
 # small_gicp-cuda（中文说明）
 
-**GPU 加速的 GICP / VGICP，面向实时 LiDAR 配准。**
+**GPU 加速的 ICP / Point-to-Plane ICP / GICP / VGICP，面向实时 LiDAR 配准。**
 
 [![CUDA 12.x](https://img.shields.io/badge/CUDA-12.x-76b900.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](https://isocpp.org/)
@@ -80,7 +80,7 @@ kd-tree 对单线程 CPU 做延迟 bound 的查询接近最优，但对 GPU 是�
 - **相同目标函数**——GICP 分布到分布因子、VGICP 体素地图因子，upstream 数学原封不动
 - **精确协方差 kNN**——扩张壳上的可证明早停界；近似邻域试过并被否决（真实序列漂移放大 50×）
 - **相同优化器**——LM 常数（λ₀=1e-3、×10、1e-3 m / 0.1°）逐行移植；6×6 求解在主机端以 double 完成
-- **20 个内核对拍测试**同时构建两种实现并逐阶段断言一致：降采样、协方差、NN、H/b/e、体素地图、端到端
+- **32 个内核对拍测试**同时构建两种实现并逐阶段断言一致：降采样、法向量/协方差、NN、ICP/Point-to-Plane/GICP H/b/e、体素地图、缓冲区复用与端到端配准
 - **实测**：100 帧对 upstream APE/RPE ≤0.01%；4541 帧全程 0.22% / 1.45%
 
 ## small_gicp vs small_gicp-cuda
@@ -92,7 +92,7 @@ kd-tree 对单线程 CPU 做延迟 bound 的查询接近最优，但对 GPU 是�
 | 邻域搜索 | 逐点树遍历 | warp 协作 GPU 搜索，可证精确 |
 | 数值精度 | 全程 double | fp32 存储/因子 + fp64 归约 + double 求解 |
 | 确定性 | 受线程调度影响 | 相同输入 → 相同输出字节，跨运行跨架构 |
-| 引擎 | ICP / Plane-ICP / GICP / VGICP | GICP + VGICP |
+| 引擎 | ICP / Plane-ICP / GICP / VGICP | ICP / Plane-ICP / GICP / VGICP |
 | 周边能力 | PCL 适配、ROS 桥、Python 绑定 | 暂无——upstream CPU 代码留在树内作对拍基线 |
 | 目标硬件 | 任意 CPU | NVIDIA GPU / Jetson Orin |
 
@@ -121,7 +121,7 @@ upstream CPU 实现原样保留在树内（`include/small_gicp`、`src/`），�
 git clone https://github.com/Functionhx/small_gicp.git && cd small_gicp
 cmake -B build -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release   # Jetson Orin 加 -DCMAKE_CUDA_ARCHITECTURES=87
 cmake --build build -j$(nproc)
-ctest --test-dir build          # 20 个内核对拍测试（需要 GPU）
+ctest --test-dir build          # 32 个内核对拍测试（需要 GPU）
 ./build/cuda/odometry_gpu <velodyne目录> --exec full-gpu --engine gicp
 ```
 
@@ -147,13 +147,18 @@ auto result = reg.align(target, source, init_T, 0.25f);
 VGICP 帧到地图：`sgc::VoxelHashMap`（带 LRU 的增量高斯体素地图）+
 `sgc::VgicpGpu::align(...)`。带运行时策略切换的基准工具：
 `cuda/bench/odometry_gpu`
-（`--exec full-gpu|hybrid|cpu --engine gicp|vgicp --nn voxel3|voxel5|exact-bf`）。
+Point-to-Point 与 Point-to-Plane 的 scan-to-scan 接口分别为 `sgc::IcpGpu` 和
+`sgc::PointToPlaneIcpGpu`；Point-to-Plane 使用 `sgc::estimate_normals` 预处理。
+
+（`--exec full-gpu|hybrid|cpu|cpu-omp --engine icp|plane_icp|gicp|vgicp|vgicp_s2s --nn voxel3|voxel5|exact-bf --cov_max_shell 12|8`）。
 
 ## Jetson
 
-已在 Jetson Orin NX（JetPack 6、CUDA 12.2、sm_87）设备端构建并验证：20/20 对拍测试通过，
-GICP 118.3 → **16.5 ms**，VGICP 102.3 → **14.2 ms**，轨迹与桌面 GPU 逐位一致。部署指南：
-[JETSON.md](JETSON.md)（cuda-jetson 分支）。
+全部 ICP 系列路径已在 12 核 Jetson Orin（JetPack/L4T R36.3、CUDA 12.2、原生 sm_87）设备端验证：
+**32/32 测试通过**，Compute Sanitizer 为 0 errors。在持续 ROS/推理负载下，quality12 的
+ICP/Point-to-Plane/GICP/VGICP model/VGICP s2s p50 为 23.85/29.48/26.03/23.16/22.79 ms；
+显式 Jetson balanced 模式（`--cov_max_shell 8`）在四条协方差路径达到 22.18/18.11/15.97/15.84 ms。
+部署和精度边界见 [JETSON.md](JETSON.md)。
 
 ## 文档
 

@@ -14,10 +14,12 @@ namespace sgc {
 
 /// @brief Device point cloud with its voxel-bucket index (built by preprocessing).
 struct GpuCloud {
-  GpuBuffer<float4> points;               ///< Points (centroids after downsampling, sorted by voxel key)
-  GpuBuffer<float> covs;                  ///< Per-point 3x3 covariances, row-major, 9 floats per point
-  GpuBuffer<unsigned long long> keys;     ///< Unique sorted voxel keys (one per point, same order)
-  VoxelHashIndex index;                   ///< O(1) voxel hash index over keys (built by Downsampler)
+  GpuBuffer<float4> points;            ///< Points (centroids after downsampling, sorted by voxel key)
+  GpuBuffer<float4> normals;           ///< Per-point normals, oriented toward the sensor origin
+  GpuBuffer<float> covs;               ///< Per-point 3x3 covariances, row-major, 9 floats per point
+  GpuBuffer<unsigned long long> keys;  ///< Unique sorted voxel keys (one per point, same order)
+  VoxelHashIndex index;                ///< O(1) voxel hash index over keys (built by Downsampler)
+  std::vector<float4> upload_staging;  ///< Reused host packing buffer for frame uploads
 
   /// @brief Number of indexed points (valid after downsampling).
   size_t size() const { return keys.size(); }
@@ -25,15 +27,23 @@ struct GpuCloud {
   /// @brief Create a raw (not yet preprocessed) cloud from host points.
   static GpuCloud from_host(const std::vector<Eigen::Vector4f>& host) {
     GpuCloud cloud;
-    cloud.points.resize(host.size());
-    std::vector<float4> tmp(host.size());
-    for (size_t i = 0; i < host.size(); i++) {
-      tmp[i] = make_float4(host[i].x(), host[i].y(), host[i].z(), host[i].w());
-    }
-    if (!tmp.empty()) {
-      cloud.points.upload(tmp.data(), tmp.size());
-    }
+    cloud.upload_from_host(host);
     return cloud;
+  }
+
+  /// @brief Replace the raw host points while retaining existing device allocations.
+  void upload_from_host(const std::vector<Eigen::Vector4f>& host) {
+    points.resize(host.size());
+    upload_staging.resize(host.size());
+    for (size_t i = 0; i < host.size(); i++) {
+      upload_staging[i] = make_float4(host[i].x(), host[i].y(), host[i].z(), host[i].w());
+    }
+    if (!upload_staging.empty()) {
+      points.upload(upload_staging.data(), upload_staging.size());
+    }
+    normals.resize(0);
+    covs.resize(0);
+    keys.resize(0);
   }
 
   /// @brief Upload an existing device-side buffer of points (takes a copy).
@@ -68,6 +78,18 @@ struct GpuCloud {
     std::vector<float> out(covs.size());
     if (!out.empty()) {
       covs.download(out.data(), out.size());
+    }
+    return out;
+  }
+
+  std::vector<Eigen::Vector4f> download_normals() const {
+    std::vector<float4> tmp(normals.size());
+    std::vector<Eigen::Vector4f> out(normals.size());
+    if (!tmp.empty()) {
+      normals.download(tmp.data(), tmp.size());
+    }
+    for (size_t i = 0; i < out.size(); i++) {
+      out[i] = Eigen::Vector4f(tmp[i].x, tmp[i].y, tmp[i].z, tmp[i].w);
     }
     return out;
   }

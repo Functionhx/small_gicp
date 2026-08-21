@@ -3,7 +3,7 @@
 
 #include <cub/cub.cuh>
 
-#include <vector>
+#include <array>
 
 #include <sgc/core/check.hpp>
 #include <sgc/voxel/hash_index.cuh>
@@ -207,27 +207,6 @@ __global__ void clear_key_kernel(unsigned long long* table_key, size_t cap) {
   }
 }
 
-__global__ void zero_u32_kernel(unsigned int* v, size_t n) {
-  const size_t pos = blockIdx.x * blockDim.x + threadIdx.x;
-  if (pos < n) {
-    v[pos] = 0;
-  }
-}
-
-__global__ void zero_f4_kernel(float4* v, size_t n) {
-  const size_t pos = blockIdx.x * blockDim.x + threadIdx.x;
-  if (pos < n) {
-    v[pos] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-  }
-}
-
-__global__ void zero_f_kernel(float* v, size_t n) {
-  const size_t pos = blockIdx.x * blockDim.x + threadIdx.x;
-  if (pos < n) {
-    v[pos] = 0.0f;
-  }
-}
-
 // Rehash for growth: move every live slot (table entry + payload) into a doubled table.
 __global__ void rehash_kernel(
   const unsigned long long* old_key,
@@ -279,15 +258,21 @@ VoxelHashMap::VoxelHashMap(double leaf_size, size_t lru_horizon, size_t lru_clea
   cov.resize(cap * 9);
   mask_ = static_cast<unsigned int>(cap - 1);
 
-  clear_key_kernel<<<grid_size(cap), BLOCK>>>(table_key.raw(), cap);
-  zero_u32_kernel<<<grid_size(cap), BLOCK>>>(count.raw(), cap);
-  zero_f4_kernel<<<grid_size(cap), BLOCK>>>(sum_pt.raw(), cap);
-  zero_f_kernel<<<grid_size(cap * 9), BLOCK>>>(sum_cov.raw(), cap * 9);
-  SGC_CHECK(cudaGetLastError());
-
   live_count_.resize(1);
-  unsigned int zero = 0;
-  live_count_.upload(&zero, 1);
+  clear();
+}
+
+void VoxelHashMap::clear() {
+  // EMPTY is all-one bits, while the accumulated payloads and live counter are zero.
+  // Async memsets stay in the default stream and therefore order before the next insert.
+  SGC_CHECK(cudaMemsetAsync(table_key.raw(), 0xFF, table_key.size() * sizeof(unsigned long long)));
+  SGC_CHECK(cudaMemsetAsync(count.raw(), 0, count.size() * sizeof(unsigned int)));
+  SGC_CHECK(cudaMemsetAsync(sum_pt.raw(), 0, sum_pt.size() * sizeof(float4)));
+  SGC_CHECK(cudaMemsetAsync(sum_cov.raw(), 0, sum_cov.size() * sizeof(float)));
+  SGC_CHECK(cudaMemsetAsync(live_count_.raw(), 0, sizeof(unsigned int)));
+  live_slots_ = 0;
+  lru_counter_ = 0;
+  inserts_since_clear_ = 0;
 }
 
 void VoxelHashMap::grow() {
@@ -304,6 +289,9 @@ void VoxelHashMap::grow() {
   GpuBuffer<float> new_cov(new_cap * 9);
   clear_key_kernel<<<grid_size(new_cap), BLOCK>>>(new_key.raw(), new_cap);
   SGC_CHECK(cudaGetLastError());
+  SGC_CHECK(cudaMemsetAsync(new_sum_pt.raw(), 0, new_cap * sizeof(float4)));
+  SGC_CHECK(cudaMemsetAsync(new_sum_cov.raw(), 0, new_cap * 9 * sizeof(float)));
+  SGC_CHECK(cudaMemsetAsync(new_count.raw(), 0, new_cap * sizeof(unsigned int)));
   rehash_kernel<<<grid_size(old_cap), BLOCK>>>(
     table_key.raw(), sum_pt.raw(), sum_cov.raw(), count.raw(), lru.raw(), old_cap, new_key.raw(), new_slot.raw(), new_sum_pt.raw(), new_sum_cov.raw(), new_count.raw(), new_lru.raw(),
     static_cast<unsigned int>(new_cap - 1));
@@ -351,7 +339,7 @@ void VoxelHashMap::insert(const GpuCloud& cloud, const Eigen::Isometry3d& T) {
 
   // T as 4 float4 rows
   {
-    std::vector<float4> hT(4);
+    std::array<float4, 4> hT;
     const Eigen::Matrix4f Tf = T.matrix().cast<float>();
     for (int r = 0; r < 4; r++) {
       hT[r] = make_float4(Tf(r, 0), Tf(r, 1), Tf(r, 2), Tf(r, 3));

@@ -158,4 +158,32 @@ TEST_F(VoxelMapTest, DeterministicAcrossRuns) {
   }
 }
 
+TEST_F(VoxelMapTest, ClearRetainsStorageAndResetsState) {
+  sgc::VoxelHashMap map(0.5);
+  map.insert(gpu, Eigen::Isometry3d::Identity());
+  ASSERT_GT(map.num_voxels(), 0u);
+
+  auto* const table_allocation = map.table_key.raw();
+  const size_t table_capacity = map.table_key.capacity();
+  map.clear();
+  EXPECT_EQ(map.num_voxels(), 0u);
+  EXPECT_EQ(map.table_key.raw(), table_allocation);
+  EXPECT_EQ(map.table_key.capacity(), table_capacity);
+
+  map.insert(gpu, Eigen::Isometry3d::Identity());
+  const auto recycled = dump_gpu_map(map);
+
+  sgc::VoxelHashMap fresh(0.5);
+  fresh.insert(gpu, Eigen::Isometry3d::Identity());
+  const auto reference = dump_gpu_map(fresh);
+  ASSERT_EQ(recycled.count, reference.count);
+  ASSERT_EQ(recycled.mean.size(), reference.mean.size());
+  for (const auto& [key, value] : recycled.mean) {
+    const auto& expected = reference.mean.at(key);
+    EXPECT_EQ(value.x(), expected.x());
+    EXPECT_EQ(value.y(), expected.y());
+    EXPECT_EQ(value.z(), expected.z());
+  }
+}
+
 }  // namespace

@@ -4,8 +4,11 @@
 // Usage:
 //   odometry_gpu <kitti_velodyne_dir> [flags]     KITTI .bin sequence
 //   odometry_gpu --synth <ply_path> [flags]       synthetic drifting sequence from one scan
-// Flags: --exec full-gpu|hybrid|cpu --engine gicp|vgicp --nn voxel3|voxel5|exact-bf
+// Flags: --exec full-gpu|hybrid|cpu|cpu-omp
+//        --engine icp|plane_icp|gicp|vgicp|vgicp_s2s
+//        --nn voxel3|voxel5|exact-bf
 //        --threads N --num_neighbors N --downsampling_resolution R --voxel_resolution R
+//        --cov_max_shell N (GPU normal/covariance cap; 12 baseline, 8 Jetson balanced)
 //        --max_correspondence_distance R --max_frames N --report out.json --traj out.txt
 //
 // Timing semantics match upstream benchmark_odom.hpp: each frame's wall time includes
@@ -17,6 +20,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Core>
@@ -27,6 +31,7 @@
 #include <sgc/io/ply.hpp>
 #include <sgc/points/gpu_cloud.hpp>
 #include <sgc/preproc/covariance.hpp>
+#include <sgc/reg/icp.hpp>
 #include <sgc/reg/gicp.hpp>
 #include <sgc/reg/vgicp.hpp>
 #include <sgc/search/nn.hpp>
@@ -39,6 +44,8 @@
 #include <small_gicp/registration/reduction_omp.hpp>
 #include <small_gicp/util/normal_estimation_omp.hpp>
 #include <small_gicp/factors/gicp_factor.hpp>
+#include <small_gicp/factors/icp_factor.hpp>
+#include <small_gicp/factors/plane_icp_factor.hpp>
 #include <small_gicp/points/eigen.hpp>
 #include <small_gicp/points/point_cloud.hpp>
 #include <small_gicp/registration/registration.hpp>
@@ -50,7 +57,9 @@ namespace {
 using Frame = std::vector<Eigen::Vector4f>;
 using Clock = std::chrono::high_resolution_clock;
 
-double msec_since(Clock::time_point t0) { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count() / 1e6; }
+double msec_since(Clock::time_point t0) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count() / 1e6;
+}
 
 std::vector<double> summarize(std::vector<double> v) {
   std::sort(v.begin(), v.end());
@@ -59,6 +68,38 @@ std::vector<double> summarize(std::vector<double> v) {
 }
 
 // ---------------------------------------------------------------- upstream CPU engines
+
+template <typename Factor, bool NeedsNormals>
+struct CpuPairwiseOdometry {
+  small_gicp::PointCloud::Ptr target;
+  std::shared_ptr<small_gicp::UnsafeKdTree<small_gicp::PointCloud>> target_tree;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    auto down = small_gicp::voxelgrid_sampling<std::vector<Eigen::Vector4f>, small_gicp::PointCloud>(frame, p.downsampling_resolution);
+    auto tree = std::make_shared<small_gicp::UnsafeKdTree<small_gicp::PointCloud>>(*down);
+    if constexpr (NeedsNormals) {
+      small_gicp::estimate_normals(*down, *tree, p.num_neighbors);
+    }
+
+    if (target == nullptr) {
+      target = down;
+      target_tree = tree;
+      return T_world;
+    }
+
+    small_gicp::Registration<Factor, small_gicp::SerialReduction> reg;
+    reg.rejector.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
+    const auto result = reg.align(*target, *down, *target_tree, Eigen::Isometry3d::Identity());
+    T_world = T_world * result.T_target_source;
+    target = down;
+    target_tree = tree;
+    return T_world;
+  }
+};
+
+using CpuIcpOdometry = CpuPairwiseOdometry<small_gicp::ICPFactor, false>;
+using CpuPlaneIcpOdometry = CpuPairwiseOdometry<small_gicp::PointToPlaneICPFactor, true>;
 
 struct CpuGicpOdometry {
   small_gicp::PointCloud::Ptr target;
@@ -113,7 +154,65 @@ struct CpuVgicpOdometry {
   Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
 };
 
+struct CpuVgicpS2sOdometry {
+  std::shared_ptr<small_gicp::GaussianVoxelMap> target_map;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    auto down = small_gicp::voxelgrid_sampling<std::vector<Eigen::Vector4f>, small_gicp::PointCloud>(frame, p.downsampling_resolution);
+    small_gicp::UnsafeKdTree<small_gicp::PointCloud> tree(*down);
+    small_gicp::estimate_covariances(*down, tree, p.num_neighbors);
+    auto current_map = std::make_shared<small_gicp::GaussianVoxelMap>(p.voxel_resolution);
+    current_map->insert(*down);
+
+    if (target_map == nullptr) {
+      target_map = std::move(current_map);
+      return T_world;
+    }
+
+    small_gicp::Registration<small_gicp::GICPFactor, small_gicp::SerialReduction> reg;
+    reg.rejector.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
+    const auto result = reg.align(*target_map, *down, *target_map, Eigen::Isometry3d::Identity());
+    T_world = T_world * result.T_target_source;
+    target_map = std::move(current_map);
+    return T_world;
+  }
+};
+
 // ---------------------------------------------------------------- upstream CPU engines (OpenMP)
+
+template <typename Factor, bool NeedsNormals>
+struct CpuOmpPairwiseOdometry {
+  small_gicp::PointCloud::Ptr target;
+  std::shared_ptr<small_gicp::KdTree<small_gicp::PointCloud>> target_tree;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    auto down = small_gicp::voxelgrid_sampling<std::vector<Eigen::Vector4f>, small_gicp::PointCloud>(frame, p.downsampling_resolution);
+    auto tree = std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(down, small_gicp::KdTreeBuilderOMP(p.num_threads));
+    if constexpr (NeedsNormals) {
+      small_gicp::estimate_normals_omp(*down, *tree, p.num_neighbors, p.num_threads);
+    }
+
+    if (target == nullptr) {
+      target = down;
+      target_tree = tree;
+      return T_world;
+    }
+
+    small_gicp::Registration<Factor, small_gicp::ParallelReductionOMP> reg;
+    reg.rejector.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
+    reg.reduction.num_threads = p.num_threads;
+    const auto result = reg.align(*target, *down, *target_tree, Eigen::Isometry3d::Identity());
+    T_world = T_world * result.T_target_source;
+    target = down;
+    target_tree = tree;
+    return T_world;
+  }
+};
+
+using CpuOmpIcpOdometry = CpuOmpPairwiseOdometry<small_gicp::ICPFactor, false>;
+using CpuOmpPlaneIcpOdometry = CpuOmpPairwiseOdometry<small_gicp::PointToPlaneICPFactor, true>;
 
 struct CpuOmpGicpOdometry {
   small_gicp::PointCloud::Ptr target;
@@ -166,6 +265,32 @@ struct CpuOmpVgicpOdometry {
   }
 };
 
+struct CpuOmpVgicpS2sOdometry {
+  std::shared_ptr<small_gicp::GaussianVoxelMap> target_map;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    auto down = small_gicp::voxelgrid_sampling<std::vector<Eigen::Vector4f>, small_gicp::PointCloud>(frame, p.downsampling_resolution);
+    auto tree = std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(down, small_gicp::KdTreeBuilderOMP(p.num_threads));
+    small_gicp::estimate_covariances_omp(*down, *tree, p.num_neighbors, p.num_threads);
+    auto current_map = std::make_shared<small_gicp::GaussianVoxelMap>(p.voxel_resolution);
+    current_map->insert(*down);
+
+    if (target_map == nullptr) {
+      target_map = std::move(current_map);
+      return T_world;
+    }
+
+    small_gicp::Registration<small_gicp::GICPFactor, small_gicp::ParallelReductionOMP> reg;
+    reg.rejector.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
+    reg.reduction.num_threads = p.num_threads;
+    const auto result = reg.align(*target_map, *down, *target_map, Eigen::Isometry3d::Identity());
+    T_world = T_world * result.T_target_source;
+    target_map = std::move(current_map);
+    return T_world;
+  }
+};
+
 // ---------------------------------------------------------------- GPU engines
 
 sgc::NNStrategy nn_of(const std::string& s) {
@@ -178,54 +303,126 @@ sgc::NNStrategy nn_of(const std::string& s) {
   return sgc::NNStrategy::Voxel5;
 }
 
-struct GpuGicpOdometry {
+template <typename Registration, bool NeedsNormals>
+struct GpuPairwiseOdometry {
   sgc::GpuCloud target;
-  sgc::GicpGpu reg;
+  sgc::GpuCloud source;
+  sgc::Downsampler downsampler;
+  Registration reg;
   bool has_target = false;
   Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
 
   Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
-    sgc::GpuCloud cloud = sgc::GpuCloud::from_host(frame);
-    sgc::Downsampler downsampler;
-    downsampler.run(cloud, frame.size(), p.downsampling_resolution);
-    sgc::estimate_covariances(cloud, p.downsampling_resolution, p.num_neighbors);
+    downsampler.prepare_input(source);
+    source.upload_from_host(frame);
+    downsampler.run(source, frame.size(), p.downsampling_resolution);
+    if constexpr (NeedsNormals) {
+      sgc::estimate_normals(source, p.downsampling_resolution, p.num_neighbors, p.covariance_max_shell);
+    }
 
     if (!has_target) {
-      target = std::move(cloud);
+      std::swap(target, source);
       has_target = true;
       return T_world;
     }
 
     reg.nn = nn_of(p.nn);
     reg.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
-    const auto result = reg.align(target, cloud, Eigen::Isometry3d::Identity(), p.downsampling_resolution);
+    const auto result = reg.align(target, source, Eigen::Isometry3d::Identity(), p.downsampling_resolution);
     T_world = T_world * result.T_target_source;
-    target = std::move(cloud);
+    std::swap(target, source);
+    return T_world;
+  }
+};
+
+using GpuIcpOdometry = GpuPairwiseOdometry<sgc::IcpGpu, false>;
+using GpuPlaneIcpOdometry = GpuPairwiseOdometry<sgc::PointToPlaneIcpGpu, true>;
+
+struct GpuGicpOdometry {
+  sgc::GpuCloud target;
+  sgc::GpuCloud source;
+  sgc::Downsampler downsampler;
+  sgc::GicpGpu reg;
+  bool has_target = false;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    downsampler.prepare_input(source);
+    source.upload_from_host(frame);
+    downsampler.run(source, frame.size(), p.downsampling_resolution);
+    sgc::estimate_covariances(source, p.downsampling_resolution, p.num_neighbors, p.covariance_max_shell);
+
+    if (!has_target) {
+      std::swap(target, source);
+      has_target = true;
+      return T_world;
+    }
+
+    reg.nn = nn_of(p.nn);
+    reg.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
+    const auto result = reg.align(target, source, Eigen::Isometry3d::Identity(), p.downsampling_resolution);
+    T_world = T_world * result.T_target_source;
+    std::swap(target, source);
     return T_world;
   }
 };
 
 struct GpuVgicpOdometry {
+  sgc::GpuCloud source;
+  sgc::Downsampler downsampler;
   std::unique_ptr<sgc::VoxelHashMap> voxelmap;
   sgc::VgicpGpu reg;
   Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
 
   Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
-    sgc::GpuCloud cloud = sgc::GpuCloud::from_host(frame);
-    sgc::Downsampler downsampler;
-    downsampler.run(cloud, frame.size(), p.downsampling_resolution);
-    sgc::estimate_covariances(cloud, p.downsampling_resolution, p.num_neighbors);
+    downsampler.prepare_input(source);
+    source.upload_from_host(frame);
+    downsampler.run(source, frame.size(), p.downsampling_resolution);
+    sgc::estimate_covariances(source, p.downsampling_resolution, p.num_neighbors, p.covariance_max_shell);
 
     if (voxelmap == nullptr) {
       voxelmap = std::make_unique<sgc::VoxelHashMap>(p.voxel_resolution);
-      voxelmap->insert(cloud, Eigen::Isometry3d::Identity());
+      voxelmap->insert(source, Eigen::Isometry3d::Identity());
       return T_world;
     }
 
     reg.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
-    const auto result = reg.align(*voxelmap, cloud, T_world);
+    const auto result = reg.align(*voxelmap, source, T_world);
     T_world = result.T_target_source;
-    voxelmap->insert(cloud, T_world);
+    voxelmap->insert(source, T_world);
+    return T_world;
+  }
+};
+
+struct GpuVgicpS2sOdometry {
+  sgc::GpuCloud source;
+  sgc::Downsampler downsampler;
+  std::unique_ptr<sgc::VoxelHashMap> target_map;
+  std::unique_ptr<sgc::VoxelHashMap> source_map;
+  sgc::VgicpGpu reg;
+  Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
+
+  Eigen::Isometry3d estimate(const Frame& frame, const sgc::bench::Policy& p) {
+    downsampler.prepare_input(source);
+    source.upload_from_host(frame);
+    downsampler.run(source, frame.size(), p.downsampling_resolution);
+    sgc::estimate_covariances(source, p.downsampling_resolution, p.num_neighbors, p.covariance_max_shell);
+
+    if (source_map == nullptr) {
+      source_map = std::make_unique<sgc::VoxelHashMap>(p.voxel_resolution);
+    } else {
+      source_map->clear();
+    }
+    source_map->insert(source, Eigen::Isometry3d::Identity());
+    if (target_map == nullptr) {
+      std::swap(target_map, source_map);
+      return T_world;
+    }
+
+    reg.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
+    const auto result = reg.align(*target_map, source, Eigen::Isometry3d::Identity());
+    T_world = T_world * result.T_target_source;
+    std::swap(target_map, source_map);
     return T_world;
   }
 };
@@ -233,6 +430,8 @@ struct GpuVgicpOdometry {
 // Hybrid: CPU preprocessing, GPU registration (data uploaded once, then GPU-resident)
 struct HybridGicpOdometry {
   sgc::GpuCloud target;
+  sgc::GpuCloud source;
+  sgc::Downsampler downsampler;
   sgc::GicpGpu reg;
   bool has_target = false;
   Eigen::Isometry3d T_world = Eigen::Isometry3d::Identity();
@@ -246,25 +445,25 @@ struct HybridGicpOdometry {
     for (size_t k = 0; k < down->points.size(); k++) {
       pts_f[k] = down->points[k].cast<float>();
     }
-    sgc::GpuCloud cloud = sgc::GpuCloud::from_host(pts_f);
+    downsampler.prepare_input(source);
+    source.upload_from_host(pts_f);
     // Hybrid semantics: CPU downsampling + kd-tree/covariance preprocessing on CPU,
     // GPU bucketing + covariance estimation + registration. (The CPU-estimated covariances
     // would need a permutation to follow the GPU bucket sort, so the GPU re-estimates them.)
-    sgc::Downsampler downsampler;  // idempotent re-bucketing at the same resolution
-    downsampler.run(cloud, pts_f.size(), p.downsampling_resolution);
-    sgc::estimate_covariances(cloud, p.downsampling_resolution, p.num_neighbors);
+    downsampler.run(source, pts_f.size(), p.downsampling_resolution);  // idempotent re-bucketing
+    sgc::estimate_covariances(source, p.downsampling_resolution, p.num_neighbors, p.covariance_max_shell);
 
     if (!has_target) {
-      target = std::move(cloud);
+      std::swap(target, source);
       has_target = true;
       return T_world;
     }
 
     reg.nn = nn_of(p.nn);
     reg.max_dist_sq = p.max_correspondence_distance * p.max_correspondence_distance;
-    const auto result = reg.align(target, cloud, Eigen::Isometry3d::Identity(), p.downsampling_resolution);
+    const auto result = reg.align(target, source, Eigen::Isometry3d::Identity(), p.downsampling_resolution);
     T_world = T_world * result.T_target_source;
-    target = std::move(cloud);
+    std::swap(target, source);
     return T_world;
   }
 };
@@ -283,6 +482,18 @@ int main(int argc, char** argv) {
     return 1;
   }
   const sgc::bench::Policy p = sgc::bench::Policy::parse(argc, argv, synth ? 3 : 2);
+  if (p.engine != "icp" && p.engine != "plane_icp" && p.engine != "gicp" && p.engine != "vgicp" && p.engine != "vgicp_s2s") {
+    std::fprintf(stderr, "unknown engine: %s\n", p.engine.c_str());
+    return 2;
+  }
+  if (p.exec != "full-gpu" && p.exec != "hybrid" && p.exec != "cpu" && p.exec != "cpu-omp") {
+    std::fprintf(stderr, "unknown execution policy: %s\n", p.exec.c_str());
+    return 2;
+  }
+  if (p.covariance_max_shell < 1 || p.covariance_max_shell > 12) {
+    std::fprintf(stderr, "--cov_max_shell must be in [1, 12]\n");
+    return 2;
+  }
 
   // ---------------------------------------------------------------- load frames
   std::vector<Frame> frames;
@@ -329,47 +540,115 @@ int main(int argc, char** argv) {
   std::vector<Eigen::Isometry3d> traj;
   std::vector<double> frame_ms;
 
+  CpuIcpOdometry cpu_icp;
+  CpuPlaneIcpOdometry cpu_plane_icp;
   CpuGicpOdometry cpu_gicp;
   CpuVgicpOdometry cpu_vgicp;
+  CpuVgicpS2sOdometry cpu_vgicp_s2s;
+  CpuOmpIcpOdometry cpu_omp_icp;
+  CpuOmpPlaneIcpOdometry cpu_omp_plane_icp;
   CpuOmpGicpOdometry cpu_omp_gicp;
   CpuOmpVgicpOdometry cpu_omp_vgicp;
+  CpuOmpVgicpS2sOdometry cpu_omp_vgicp_s2s;
+  GpuIcpOdometry gpu_icp;
+  GpuPlaneIcpOdometry gpu_plane_icp;
   GpuGicpOdometry gpu_gicp;
   GpuVgicpOdometry gpu_vgicp;
+  GpuVgicpS2sOdometry gpu_vgicp_s2s;
   HybridGicpOdometry hybrid_gicp;
 
-  for (auto& frame : frames) {
-    // Warm up the GPU on the first frame only (context / module load, excluded from steady stats)
+  for (size_t frame_index = 0; frame_index < frames.size(); frame_index++) {
+    auto& frame = frames[frame_index];
     const auto t0 = Clock::now();
     Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
 
     if (p.exec == "cpu") {
-      T = p.engine == "vgicp" ? cpu_vgicp.estimate(frame, p) : cpu_gicp.estimate(frame, p);
+      if (p.engine == "icp") {
+        T = cpu_icp.estimate(frame, p);
+      } else if (p.engine == "plane_icp") {
+        T = cpu_plane_icp.estimate(frame, p);
+      } else if (p.engine == "vgicp") {
+        T = cpu_vgicp.estimate(frame, p);
+      } else if (p.engine == "vgicp_s2s") {
+        T = cpu_vgicp_s2s.estimate(frame, p);
+      } else {
+        T = cpu_gicp.estimate(frame, p);
+      }
     } else if (p.exec == "cpu-omp") {
-      T = p.engine == "vgicp" ? cpu_omp_vgicp.estimate(frame, p) : cpu_omp_gicp.estimate(frame, p);
+      if (p.engine == "icp") {
+        T = cpu_omp_icp.estimate(frame, p);
+      } else if (p.engine == "plane_icp") {
+        T = cpu_omp_plane_icp.estimate(frame, p);
+      } else if (p.engine == "vgicp") {
+        T = cpu_omp_vgicp.estimate(frame, p);
+      } else if (p.engine == "vgicp_s2s") {
+        T = cpu_omp_vgicp_s2s.estimate(frame, p);
+      } else {
+        T = cpu_omp_gicp.estimate(frame, p);
+      }
     } else if (p.exec == "hybrid") {
+      if (p.engine != "gicp") {
+        std::fprintf(stderr, "hybrid execution currently supports only gicp\n");
+        return 2;
+      }
       T = hybrid_gicp.estimate(frame, p);
     } else {
-      T = p.engine == "vgicp" ? gpu_vgicp.estimate(frame, p) : gpu_gicp.estimate(frame, p);
+      if (p.engine == "icp") {
+        T = gpu_icp.estimate(frame, p);
+      } else if (p.engine == "plane_icp") {
+        T = gpu_plane_icp.estimate(frame, p);
+      } else if (p.engine == "vgicp") {
+        T = gpu_vgicp.estimate(frame, p);
+      } else if (p.engine == "vgicp_s2s") {
+        T = gpu_vgicp_s2s.estimate(frame, p);
+      } else {
+        T = gpu_gicp.estimate(frame, p);
+      }
     }
     cudaDeviceSynchronize();
-    frame_ms.push_back(msec_since(t0));
+    // Frame zero primes the target and CUDA context; exclude it from steady-state statistics.
+    if (frame_index > 0) {
+      frame_ms.push_back(msec_since(t0));
+    }
     traj.push_back(T);
   }
 
   // ---------------------------------------------------------------- report
   const auto stats = summarize(frame_ms);
   const double mean = std::accumulate(frame_ms.begin(), frame_ms.end(), 0.0) / std::max<size_t>(1, frame_ms.size());
-  std::fprintf(stderr,
-               "result policy=%s frames=%zu min=%.2f p50=%.2f p95=%.2f max=%.2f mean=%.2f [msec/frame]  throughput=%.1f [fps]\n",  //
-               p.tag().c_str(), traj.size(), stats[0], stats[1], stats[2], stats[3], mean, 1000.0 / std::max(1e-9, mean));
+  std::fprintf(
+    stderr,
+    "result policy=%s frames=%zu timed_frames=%zu min=%.2f p50=%.2f p95=%.2f max=%.2f mean=%.2f [msec/frame]  throughput=%.1f [fps]\n",  //
+    p.tag().c_str(),
+    traj.size(),
+    frame_ms.size(),
+    stats[0],
+    stats[1],
+    stats[2],
+    stats[3],
+    mean,
+    1000.0 / std::max(1e-9, mean));
 
   if (!p.traj.empty()) {
     FILE* f = std::fopen(p.traj.c_str(), "w");
     if (f) {
       for (const auto& T : traj) {
         const Eigen::Matrix<double, 3, 4> m = T.matrix().block<3, 4>(0, 0);
-        std::fprintf(f, "%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f\n", m(0, 0), m(0, 1), m(0, 2), m(0, 3), m(1, 0), m(1, 1), m(1, 2), m(1, 3),
-                     m(2, 0), m(2, 1), m(2, 2), m(2, 3));
+        std::fprintf(
+          f,
+          "%.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f %.9f\n",
+          m(0, 0),
+          m(0, 1),
+          m(0, 2),
+          m(0, 3),
+          m(1, 0),
+          m(1, 1),
+          m(1, 2),
+          m(1, 3),
+          m(2, 0),
+          m(2, 1),
+          m(2, 2),
+          m(2, 3));
       }
       std::fclose(f);
     }
@@ -380,9 +659,21 @@ int main(int argc, char** argv) {
     if (f) {
       size_t free_mem = 0, total_mem = 0;
       cudaMemGetInfo(&free_mem, &total_mem);
-      std::fprintf(f,
-                   "{\"policy\":\"%s\",\"frames\":%zu,\"min_ms\":%.3f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,\"max_ms\":%.3f,\"mean_ms\":%.3f,\"fps\":%.2f,\"gpu_mem_used_mb\":%.1f}\n",
-                   p.tag().c_str(), traj.size(), stats[0], stats[1], stats[2], stats[3], mean, 1000.0 / std::max(1e-9, mean), (total_mem - free_mem) / 1048576.0);
+      std::fprintf(
+        f,
+        "{\"policy\":\"%s\",\"frames\":%zu,\"timed_frames\":%zu,\"covariance_max_shell\":%d,\"min_ms\":%.3f,\"p50_ms\":%.3f,\"p95_ms\":%.3f,\"max_ms\":%.3f,\"mean_ms\":%.3f,\"fps\":%.2f,\"gpu_mem_used_mb\":%"
+        ".1f}\n",
+        p.tag().c_str(),
+        traj.size(),
+        frame_ms.size(),
+        p.covariance_max_shell,
+        stats[0],
+        stats[1],
+        stats[2],
+        stats[3],
+        mean,
+        1000.0 / std::max(1e-9, mean),
+        (total_mem - free_mem) / 1048576.0);
       std::fclose(f);
     }
   }

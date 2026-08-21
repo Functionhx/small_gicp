@@ -9,11 +9,12 @@ namespace sgc::bench {
 
 /// @brief Runtime policy shared by the benchmark harness and tests.
 struct Policy {
-  std::string exec = "full-gpu";  // full-gpu | hybrid | cpu
-  std::string engine = "gicp";    // gicp | vgicp
+  std::string exec = "full-gpu";  // full-gpu | hybrid | cpu | cpu-omp
+  std::string engine = "gicp";    // icp | plane_icp | gicp | vgicp | vgicp_s2s
   std::string nn = "voxel5";      // voxel3 | voxel5 | exact-bf (GICP engine only)
   int num_threads = 1;            // CPU engine threads
   int num_neighbors = 20;
+  int covariance_max_shell = 12;  // 12=quality baseline, 8=Jetson balanced
   double downsampling_resolution = 0.25;
   double voxel_resolution = 1.0;  // VGICP map voxel size
   double max_correspondence_distance = 1.0;
@@ -36,6 +37,8 @@ struct Policy {
         p.num_threads = std::stoi(next());
       } else if (a == "--num_neighbors") {
         p.num_neighbors = std::stoi(next());
+      } else if (a == "--cov_max_shell") {
+        p.covariance_max_shell = std::stoi(next());
       } else if (a == "--downsampling_resolution") {
         p.downsampling_resolution = std::stod(next());
       } else if (a == "--voxel_resolution") {

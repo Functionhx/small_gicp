@@ -63,11 +63,11 @@ TEST_F(CovarianceTest, ParityWithUpstream) {
   std::vector<double> rels;
   const double median = compare(rels);
   EXPECT_LT(median, 1e-4);
-  EXPECT_LT(rels[rels.size() * 99 / 100], 1e-3);   // p99
+  EXPECT_LT(rels[rels.size() * 99 / 100], 1e-3);  // p99
   // A handful of points hit exact distance ties at the k-th boundary, swapping one neighbor.
   // Identical neighbor sets are proven to reproduce upstream covariances; see WORKLOG.
-  EXPECT_LT(rels.back(), 5e-2);                    // max (isolated tie outliers only)
-  EXPECT_LT(rels[rels.size() * 999 / 1000], 5e-3); // p99.9
+  EXPECT_LT(rels.back(), 5e-2);                     // max (isolated tie outliers only)
+  EXPECT_LT(rels[rels.size() * 999 / 1000], 5e-3);  // p99.9
 }
 
 TEST_F(CovarianceTest, DeterministicAcrossRuns) {
@@ -78,6 +78,52 @@ TEST_F(CovarianceTest, DeterministicAcrossRuns) {
     const auto again = gpu.download_covs();
     EXPECT_EQ(again, first);
   }
+}
+
+TEST_F(CovarianceTest, NormalsParityWithUpstream) {
+  small_gicp::UnsafeKdTree<small_gicp::PointCloud> tree(*ref);
+  small_gicp::estimate_normals(*ref, tree, 20);
+  sgc::estimate_normals(gpu, 0.25f, 20);
+
+  const auto normals = gpu.download_normals();
+  ASSERT_EQ(normals.size(), ref->size());
+  std::vector<double> errors;
+  errors.reserve(ref->size());
+  for (size_t i = 0; i < ref->size(); i++) {
+    // Eigenvector signs are mathematically arbitrary. Orientation matches except for points
+    // whose point-normal dot product is numerically zero, and the point-to-plane factor is
+    // sign-invariant, so compare the represented plane normal.
+    const double same = (normals[i].cast<double>() - ref->normals[i]).norm();
+    const double flipped = (normals[i].cast<double>() + ref->normals[i]).norm();
+    errors.push_back(std::min(same, flipped));
+  }
+  std::sort(errors.begin(), errors.end());
+  EXPECT_LT(errors[errors.size() / 2], 1e-4);
+  EXPECT_LT(errors[errors.size() * 99 / 100], 2e-3);
+  EXPECT_LT(errors.back(), 0.2);  // isolated k-th-neighbor tie outliers
+}
+
+TEST_F(CovarianceTest, CombinedNormalsCovariancesDeterministic) {
+  sgc::estimate_normals_covariances(gpu, 0.25f, 20);
+  const auto first_normals = gpu.download_normals();
+  const auto first_covs = gpu.download_covs();
+  sgc::estimate_normals_covariances(gpu, 0.25f, 20);
+  EXPECT_EQ(gpu.download_normals(), first_normals);
+  EXPECT_EQ(gpu.download_covs(), first_covs);
+}
+
+TEST_F(CovarianceTest, BalancedShellDeterministic) {
+  sgc::estimate_normals_covariances(gpu, 0.25f, 20, 8);
+  const auto first_normals = gpu.download_normals();
+  const auto first_covs = gpu.download_covs();
+  sgc::estimate_normals_covariances(gpu, 0.25f, 20, 8);
+  EXPECT_EQ(gpu.download_normals(), first_normals);
+  EXPECT_EQ(gpu.download_covs(), first_covs);
+}
+
+TEST_F(CovarianceTest, RejectsInvalidShellCap) {
+  EXPECT_THROW(sgc::estimate_covariances(gpu, 0.25f, 20, 0), std::invalid_argument);
+  EXPECT_THROW(sgc::estimate_covariances(gpu, 0.25f, 20, 13), std::invalid_argument);
 }
 
 }  // namespace

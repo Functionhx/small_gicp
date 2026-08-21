@@ -3,6 +3,7 @@
 
 #include <cub/cub.cuh>
 
+#include <utility>
 #include <vector>
 
 #include <sgc/core/check.hpp>
@@ -56,57 +57,60 @@ __global__ void invalid_start_kernel(const unsigned long long* sorted_keys, size
   }
 }
 
-// One block per voxel. Per-thread strided fp64 accumulation + fixed shared-memory tree reduction.
+// One warp per voxel. LiDAR voxel runs are typically much smaller than 256 points, so
+// processing eight voxels per block avoids launching a mostly idle full block per run.
 __global__ void centroid_kernel(
   const float4* raw_points,
   const unsigned int* sorted_values,
   const unsigned long long* sorted_keys,
   const unsigned int* starts,
   unsigned int num_buckets,
-  unsigned int invalid_start,
+  const unsigned int* invalid_start,
   float4* out_points,
   unsigned long long* out_keys) {
-  const unsigned int bucket = blockIdx.x;
+  const unsigned int lane = threadIdx.x & 31;
+  const unsigned int bucket = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
   if (bucket >= num_buckets) {
     return;
   }
 
   const unsigned int s = starts[bucket];
-  const unsigned int e = (bucket + 1 < num_buckets) ? starts[bucket + 1] : invalid_start;
-
-  __shared__ double sx[BLOCK], sy[BLOCK], sz[BLOCK], sw[BLOCK];
+  const unsigned int e = (bucket + 1 < num_buckets) ? starts[bucket + 1] : invalid_start[0];
 
   double px = 0.0, py = 0.0, pz = 0.0, pw = 0.0;
-  for (unsigned int i = s + threadIdx.x; i < e; i += BLOCK) {
+  for (unsigned int i = s + lane; i < e; i += 32) {
     const float4 p = raw_points[sorted_values[i]];
     px += p.x;
     py += p.y;
     pz += p.z;
     pw += p.w;
   }
-  sx[threadIdx.x] = px;
-  sy[threadIdx.x] = py;
-  sz[threadIdx.x] = pz;
-  sw[threadIdx.x] = pw;
-  __syncthreads();
-
-  for (int stride = BLOCK / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      sx[threadIdx.x] += sx[threadIdx.x + stride];
-      sy[threadIdx.x] += sy[threadIdx.x + stride];
-      sz[threadIdx.x] += sz[threadIdx.x + stride];
-      sw[threadIdx.x] += sw[threadIdx.x + stride];
-    }
-    __syncthreads();
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    px += __shfl_down_sync(0xffffffffu, px, offset);
+    py += __shfl_down_sync(0xffffffffu, py, offset);
+    pz += __shfl_down_sync(0xffffffffu, pz, offset);
+    pw += __shfl_down_sync(0xffffffffu, pw, offset);
   }
 
-  if (threadIdx.x == 0) {
-    out_points[bucket] = make_float4(static_cast<float>(sx[0] / sw[0]), static_cast<float>(sy[0] / sw[0]), static_cast<float>(sz[0] / sw[0]), 1.0f);
+  if (lane == 0) {
+    out_points[bucket] = make_float4(static_cast<float>(px / pw), static_cast<float>(py / pw), static_cast<float>(pz / pw), 1.0f);
     out_keys[bucket] = sorted_keys[s];
   }
 }
 
 }  // namespace
+
+void Downsampler::prepare_input(GpuCloud& cloud) {
+  // After run(), out_points_ owns the large raw-input allocation while cloud owns the
+  // compact centroid allocation. Swap both pools back so the next upload and output reuse
+  // their naturally sized storage without cudaMalloc/cudaFree churn.
+  std::swap(cloud.points, out_points_);
+  std::swap(cloud.keys, out_keys_);
+  cloud.points.resize(0);
+  cloud.keys.resize(0);
+  out_points_.resize(0);
+  out_keys_.resize(0);
+}
 
 void Downsampler::ensure_sizes(size_t n) {
   if (keys_in_.size() != n) {
@@ -172,24 +176,25 @@ void Downsampler::run(GpuCloud& cloud, size_t num_raw, double leaf_size) {
   invalid_start_.upload(&n_raw, 1);
   invalid_start_kernel<<<grid_size(num_raw), BLOCK>>>(sorted_keys_.raw(), num_raw, invalid_start_.raw());
   SGC_CHECK(cudaGetLastError());
-  unsigned int invalid_start = 0;
-  invalid_start_.download(&invalid_start, 1);
 
-  starts_.resize(num_buckets + 1);
+  starts_.resize(num_buckets);
   scatter_starts_kernel<<<grid_size(num_raw), BLOCK>>>(sorted_keys_.raw(), flags_.raw(), prefix_.raw(), num_raw, starts_.raw());
   SGC_CHECK(cudaGetLastError());
-  SGC_CHECK(cudaMemcpy(starts_.raw() + num_buckets, &invalid_start, sizeof(unsigned int), cudaMemcpyHostToDevice));
 
   out_points_.resize(num_buckets);
   out_keys_.resize(num_buckets);
-  centroid_kernel<<<static_cast<int>(num_buckets), BLOCK>>>(
-    cloud.points.raw(), sorted_values_.raw(), sorted_keys_.raw(), starts_.raw(), num_buckets, invalid_start, out_points_.raw(), out_keys_.raw());
+  constexpr int CENTROID_WARPS = BLOCK / 32;
+  const int centroid_grid = (static_cast<int>(num_buckets) + CENTROID_WARPS - 1) / CENTROID_WARPS;
+  centroid_kernel<<<centroid_grid, BLOCK>>>(
+    cloud.points.raw(), sorted_values_.raw(), sorted_keys_.raw(), starts_.raw(), num_buckets, invalid_start_.raw(), out_points_.raw(), out_keys_.raw());
   SGC_CHECK(cudaGetLastError());
 
-  cloud.points = std::move(out_points_);
-  cloud.keys = std::move(out_keys_);
-  out_points_ = GpuBuffer<float4>();
-  out_keys_ = GpuBuffer<unsigned long long>();
+  // Swap rather than move-and-destroy so the raw input and prior key allocations become
+  // scratch storage for the next frame. GpuBuffer::resize retains their capacity.
+  std::swap(cloud.points, out_points_);
+  std::swap(cloud.keys, out_keys_);
+  out_points_.resize(0);
+  out_keys_.resize(0);
   cloud.index.build(cloud.keys.raw(), num_buckets);
 }
 

@@ -41,4 +41,8 @@ endif()
 ## Benches ###
 ##############
 add_executable(odometry_gpu bench/odometry_gpu.cpp)
-target_link_libraries(odometry_gpu PRIVATE sgc CUDA::cudart)
+target_link_libraries(odometry_gpu PRIVATE
+  sgc
+  CUDA::cudart
+  $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>
+)

@@ -1,6 +1,6 @@
 # small_gicp-cuda
 
-**GPU-accelerated GICP / VGICP for real-time LiDAR registration.**
+**GPU-accelerated ICP / Point-to-Plane ICP / GICP / VGICP for real-time LiDAR registration.**
 
 [![CUDA 12.x](https://img.shields.io/badge/CUDA-12.x-76b900.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)](https://isocpp.org/)
@@ -86,7 +86,7 @@ Speed was not bought with approximation:
 - **Same objective** — GICP distribution-to-distribution factors, VGICP voxel-map factors, upstream math unchanged
 - **Exact covariance kNN** — provable early-stop bound on expanding shells; approximate neighborhoods were tried and rejected (50× drift amplification on real sequences)
 - **Same optimizer** — LM constants (λ₀=1e-3, ×10, 1e-3 m / 0.1°) ported line-by-line; 6×6 solve in double on the host
-- **20 kernel-parity tests** build both implementations and assert agreement stage by stage: downsampling, covariances, NN, H/b/e, voxel map, end-to-end
+- **32 kernel-parity tests** build both implementations and assert agreement stage by stage: downsampling, normals/covariances, NN, ICP/Point-to-Plane/GICP H/b/e, voxel map, buffer/map reuse, and end-to-end alignment
 - **Measured**: ≤0.01% APE/RPE vs upstream on 100 frames; 0.22% / 1.45% over 4541 frames
 
 ## small_gicp vs small_gicp-cuda
@@ -98,7 +98,7 @@ Speed was not bought with approximation:
 | Neighbor search | per-point tree traversal | warp-cooperative GPU search, provably exact |
 | Precision | double throughout | fp32 storage/factor math + fp64 reductions + double solve |
 | Determinism | thread-scheduling dependent | same input → same output bytes, across runs and architectures |
-| Engines | ICP / Plane-ICP / GICP / VGICP | GICP + VGICP |
+| Engines | ICP / Plane-ICP / GICP / VGICP | ICP / Plane-ICP / GICP / VGICP |
 | Extras | PCL adapter, ROS bridge, Python bindings | none yet — upstream CPU code stays in-tree as the parity baseline |
 | Target hardware | any CPU | NVIDIA GPU / Jetson Orin |
 
@@ -129,7 +129,7 @@ neighbor search · CUDA engineers looking for a data-structure redesign case stu
 git clone https://github.com/Functionhx/small_gicp.git && cd small_gicp
 cmake -B build -DBUILD_CUDA=ON -DCMAKE_BUILD_TYPE=Release   # add -DCMAKE_CUDA_ARCHITECTURES=87 for Jetson Orin
 cmake --build build -j$(nproc)
-ctest --test-dir build          # 20 kernel-parity tests (requires a GPU)
+ctest --test-dir build          # 32 kernel-parity tests (requires a GPU)
 ./build/cuda/odometry_gpu <velodyne_dir> --exec full-gpu --engine gicp
 ```
 
@@ -152,16 +152,24 @@ sgc::GicpGpu reg;                                                 // LM constant
 auto result = reg.align(target, source, init_T, 0.25f);
 ```
 
+Point-to-point and Point-to-Plane scan-to-scan registration are exposed as `sgc::IcpGpu` and
+`sgc::PointToPlaneIcpGpu` (`<sgc/reg/icp.hpp>`). Point-to-Plane preprocessing uses
+`sgc::estimate_normals`; normals and covariances can be fused in one pass with
+`sgc::estimate_normals_covariances`.
+
 VGICP scan-to-model: `sgc::VoxelHashMap` (incremental Gaussian voxel map with LRU) +
 `sgc::VgicpGpu::align(...)`. Benchmark harness with runtime-switchable policies:
 `cuda/bench/odometry_gpu`
-(`--exec full-gpu|hybrid|cpu --engine gicp|vgicp --nn voxel3|voxel5|exact-bf`).
+(`--exec full-gpu|hybrid|cpu|cpu-omp --engine icp|plane_icp|gicp|vgicp|vgicp_s2s --nn voxel3|voxel5|exact-bf --cov_max_shell 12|8`).
 
 ## Jetson
 
-Built and validated on-device on Jetson Orin NX (JetPack 6, CUDA 12.2, sm_87): 20/20 parity
-tests pass, GICP 118.3 → **16.5 ms**, VGICP 102.3 → **14.2 ms**, trajectories bit-agree with
-the desktop GPU. Deployment guide: [JETSON.md](JETSON.md) (cuda-jetson branch).
+All ICP-family paths are built and validated on-device on a 12-core Jetson Orin
+(JetPack/L4T R36.3, CUDA 12.2, native sm_87): **32/32 tests pass** and Compute Sanitizer
+reports zero errors. Under the live ROS/inference workload, the quality baseline p50 is
+23.85/29.48/26.03/23.16/22.79 ms for ICP/Point-to-Plane/GICP/VGICP model/VGICP s2s;
+the explicit Jetson balanced profile (`--cov_max_shell 8`) reaches 22.18/18.11/15.97/15.84 ms
+for the four covariance-dependent paths. Deployment and accuracy envelope: [JETSON.md](JETSON.md).
 
 ## Documentation
 
