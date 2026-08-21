@@ -1,0 +1,62 @@
+{
+  "assessment": "ready with stated caveats",
+  "checks_passed": 9,
+  "checks_failed": 0,
+  "checks": [
+    {
+      "name": "optimized matrix report count",
+      "status": "passed",
+      "detail": "200 JSON reports"
+    },
+    {
+      "name": "optimized matrix trajectory count",
+      "status": "passed",
+      "detail": "200 trajectories"
+    },
+    {
+      "name": "base/new A-B report count",
+      "status": "passed",
+      "detail": "180 JSON reports"
+    },
+    {
+      "name": "base/new A-B trajectory count",
+      "status": "passed",
+      "detail": "180 trajectories"
+    },
+    {
+      "name": "JSON metric invariants",
+      "status": "passed",
+      "detail": "380 reports parsed"
+    },
+    {
+      "name": "trajectory row count",
+      "status": "passed",
+      "detail": "380 trajectories x 100 poses"
+    },
+    {
+      "name": "headline median recomputation",
+      "status": "passed",
+      "detail": "5/5 headline p50 medians matched raw reports"
+    },
+    {
+      "name": "paired speedup recomputation",
+      "status": "passed",
+      "detail": "GICP balanced8 vs CPU8 = 1.546290x"
+    },
+    {
+      "name": "source commit",
+      "status": "passed",
+      "detail": "6e836f60c04e2cf40069b25384b15764ac7757e2"
+    }
+  ],
+  "source_sha256": {
+    "summary.json": "492ca18817c68c2ac5b49a69f2c5b7e2dfb2c01bd736a9d218ee2e4bc6cfa995",
+    "ab_summary.json": "bc41323ac019f0f0cd09ed21f7248b5426f1bc3f5f0a6a8d4ca1c49b3e111c81"
+  },
+  "required_caveats": [
+    "Results are conditional on the observed live ROS/inference workload, not isolated peak throughput.",
+    "balanced8 is an explicit approximate covariance-search profile and was not evaluated against KITTI ground truth.",
+    "FastVGICPCuda default and project VGICP s2s use different preprocessing pipelines."
+  ],
+  "commit": "6e836f60c04e2cf40069b25384b15764ac7757e2"
+}

@@ -1,0 +1,640 @@
+\documentclass[UTF8,a4paper,11pt,fontset=none]{ctexart}
+
+\usepackage{fontspec}
+\setmainfont{TeX Gyre Pagella}
+\setsansfont{TeX Gyre Heros}
+\setmonofont{DejaVu Sans Mono}
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans CJK SC}
+
+\usepackage[margin=2.15cm,headheight=15pt]{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{amsmath,amssymb}
+\usepackage{siunitx}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage[unicode,colorlinks=true,linkcolor=blue!55!black,urlcolor=blue!60!black,citecolor=blue!55!black]{hyperref}
+\usepackage{bookmark}
+
+\definecolor{ReportBlue}{HTML}{0169CC}
+\definecolor{ReportBlueLight}{HTML}{99CEFF}
+\definecolor{ReportOrange}{HTML}{E47716}
+\definecolor{ReportInk}{HTML}{17212B}
+\definecolor{ReportMuted}{HTML}{5D6874}
+\definecolor{ReportGrid}{HTML}{D9DEE5}
+\definecolor{ReportSurface}{HTML}{F4F7FA}
+\definecolor{ReportDarkGray}{HTML}{5B6570}
+\definecolor{ReportLightGray}{HTML}{AEB6BF}
+
+\hypersetup{
+  pdftitle={从 cuda-x86 到 cuda-jetson：small-gicp CUDA 迁移与优化工作报告},
+  pdfauthor={Functionhx/small-gicp 工程记录},
+  pdfsubject={Jetson Orin CUDA migration and optimization},
+  pdfkeywords={small-gicp, CUDA, Jetson Orin, GICP, VGICP, ICP, Nsight}
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{ReportMuted}small\_gicp CUDA 迁移工作报告}
+\fancyhead[R]{\small\color{ReportMuted}cuda-jetson · 6e836f6}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.35pt}
+
+\titleformat{\section}{\Large\bfseries\sffamily\color{ReportInk}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\sffamily\color{ReportInk}}{\thesubsection}{0.7em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\sffamily\color{ReportInk}}{\thesubsubsection}{0.7em}{}
+
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.3em}
+\setlist[itemize]{leftmargin=2em,itemsep=0.25em,topsep=0.35em}
+\setlist[enumerate]{leftmargin=2.2em,itemsep=0.3em,topsep=0.35em}
+\renewcommand{\arraystretch}{1.18}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{C}{>{\centering\arraybackslash}X}
+
+\lstdefinestyle{reportcode}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{ReportSurface},
+  frame=single,
+  rulecolor=\color{ReportGrid},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  xleftmargin=0.4em,
+  xrightmargin=0.4em,
+  aboveskip=0.7em,
+  belowskip=0.7em
+}
+
+\newcommand{\metric}[1]{\textbf{\color{ReportBlue}#1}}
+\newcommand{\profilequality}{\texttt{quality12}}
+\newcommand{\profilebalanced}{\texttt{balanced8}}
+\newcommand{\commitid}{\texttt{6e836f6}}
+
+\begin{document}
+
+\hypersetup{pageanchor=false}
+\begin{titlepage}
+  \centering
+  \vspace*{2.1cm}
+  {\sffamily\bfseries\fontsize{28}{36}\selectfont\color{ReportInk}
+    从 \texttt{cuda-x86} 到 \texttt{cuda-jetson}\par}
+  \vspace{0.55cm}
+  {\sffamily\fontsize{18}{26}\selectfont\color{ReportBlue}
+    small\_gicp CUDA 迁移与优化工作报告\par}
+  \vspace{1.2cm}
+  {\large 技术受众版 · 2026 年 8 月 21 日\par}
+  \vspace{0.35cm}
+  {\normalsize 目标提交：\href{https://github.com/Functionhx/small_gicp/commit/6e836f60c04e2cf40069b25384b15764ac7757e2}{\commitid}\par}
+
+  \vfill
+  \begin{minipage}{0.88\textwidth}
+    \colorbox{ReportSurface}{%
+      \parbox{0.94\linewidth}{
+        \vspace{0.45em}
+        \textbf{报告结论。}迁移并不是把 \texttt{sm\_89} 重新编译成 \texttt{sm\_87}，
+        而是围绕 Jetson 的共享资源、较弱 CPU、统一内存和持续业务负载，重新划分
+        内存生命周期、CPU/GPU 同步边界与 kernel 粒度。最终默认质量模式在全部五类
+        ICP 路径上超过 small\_gicp 8 线程；显式 Jetson 平衡模式在协方差相关路径上
+        进一步达到 \metric{1.50--2.18 倍}加速。
+        \vspace{0.45em}
+      }}
+  \end{minipage}
+  \vfill
+
+  \begin{tabular}{rl}
+    项目分支： & \texttt{cuda-jetson} \\
+    设备工具链： & CUDA 12.2 / GCC 11.4 / native \texttt{sm\_87} \\
+    验证状态： & 32/32 CTest，Compute Sanitizer 0 errors \\
+    数据范围： & KITTI odometry 00，100 帧，10 个交错区组
+  \end{tabular}
+  \vspace*{1.2cm}
+\end{titlepage}
+
+\hypersetup{pageanchor=true}
+\pagenumbering{roman}
+\begingroup
+  \small
+  \setlength{\parskip}{0pt}
+  \tableofcontents
+\endgroup
+\clearpage
+\pagenumbering{arabic}
+
+\section*{技术摘要}
+\addcontentsline{toc}{section}{技术摘要}
+
+本次工作从已能在桌面 \texttt{cuda-x86} 路径运行的 ICP、Point-to-Plane ICP、GICP
+和 VGICP 出发，先在 Jetson 上完成 native \texttt{sm\_87} 构建、OpenMP CPU 对照、
+GPU 调试权限和 Nsight 工具链，再在不暂停 ROS、LIO、YOLO、PointPillar、RViz 与桌面
+负载的条件下进行端到端诊断。迁移后的关键成果如下。
+
+\begin{itemize}
+  \item \textbf{质量基线不以近似换速度。}\profilequality 保留原 covariance shell 上限 12，
+        相对保存的初始 Jetson 二进制，五类算法 p50 提升约 8\%--19\%，100 帧最大轨迹差
+        低于 \SI{0.4}{\milli\metre} 和 \ang{0.004}。
+  \item \textbf{平衡模式显式暴露质量---吞吐权衡。}\profilebalanced 将 shell 上限设为 8，
+        对 Point-to-Plane、GICP、VGICP model 和 VGICP s2s 分别达到
+        \metric{22.18、18.11、15.97、15.84 ms} p50；该模式不会替换默认配置。
+  \item \textbf{数据流比单个算子更重要。}\par
+        GICP 20 帧的 D2H 从 \SI{48.1}{MB} 降至 \SI{0.035}{MB}；CUDA 内存分配和
+        释放调用从 453/453 次降至 67/67 次；centroid 从约 2.48 降至
+        \SI{1.29}{ms/frame}。
+  \item \textbf{失败实验被保留为工程知识。}64 元素 warp-bitonic top-k 虽通过全部测试，
+        但在稀疏 LiDAR voxel 上慢 12\%--15\%，因此回退；机械 CUDA Graph 展开也因
+        LM 动态 accept/reject 依赖而未保留。
+\end{itemize}
+
+本报告的性能结论是\textbf{真实并发负载下的条件性能}，不是空载峰值。所有主结果均来自
+100 帧、99 个计时帧、10 个轮换顺序区组；每个速度比先在同一区组配对计算，再取中位数。
+
+\section{迁移不是重新实现算法，而是重新设计资源边界}
+
+\texttt{cuda-x86} 已经提供完整的 GPU 数据通路：点云上传、voxel downsampling、
+法向量/协方差估计、近邻搜索、ICP 因子线性化、LM 优化和 VGICP voxel map。
+如果只修改 CMake 架构并在 Jetson 上编译，功能可以运行，但端到端表现并不稳定：
+Point-to-Plane 与 GICP 一度只和 small\_gicp 8T 持平，且大量时间被记在
+\texttt{cudaFree}、\texttt{cudaMemcpy} 和 covariance preprocessing 上。
+
+因此迁移遵循“先跑通、再测量、后改变边界”的顺序，而不是预先假设某个 kernel 必须重写。
+图~\ref{fig:migration-flow} 给出了实际工作流。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      node distance=0.65cm and 0.65cm,
+      stage/.style={rounded corners=3pt,draw=ReportBlue!65,fill=ReportBlueLight!23,
+                    minimum height=1.55cm,text width=4.25cm,align=center,font=\small\sffamily},
+      verify/.style={stage,draw=ReportOrange!80,fill=ReportOrange!10},
+      arrow/.style={-{Latex[length=2.6mm]},very thick,draw=ReportMuted}
+    ]
+    \node[stage] (x86) {1. \texttt{cuda-x86} 基线\\四类算法与统一 benchmark};
+    \node[stage,right=of x86] (bringup) {2. Jetson bring-up\\CUDA 12.2、GCC 11、\texttt{sm\_87}};
+    \node[stage,right=of bringup] (profile) {3. 真实负载 profiling\\Nsight Systems / Compute};
+    \node[stage,below=1.0cm of profile] (kernel) {4. 内存与 kernel 重构\\归约、复用、centroid、eigen};
+    \node[stage,left=of kernel] (profiles) {5. 显式质量策略\\\profilequality / \profilebalanced};
+    \node[verify,left=of profiles] (gate) {6. 设备验收与发布\\32 tests、memcheck、10-block A/B};
+    \draw[arrow] (x86) -- (bringup);
+    \draw[arrow] (bringup) -- (profile);
+    \draw[arrow] (profile) -- (kernel);
+    \draw[arrow] (kernel) -- (profiles);
+    \draw[arrow] (profiles) -- (gate);
+  \end{tikzpicture}
+  \caption{从 x86 CUDA 基线到 Jetson CUDA 发布版本的六阶段迁移流程。每个性能修改都位于设备 profiling 之后，并在进入下一阶段前通过数值门槛。}
+  \label{fig:migration-flow}
+\end{figure}
+
+\section{两类平台的差异决定了迁移策略}
+
+表~\ref{tab:platform} 展示了本次迁移真正相关的差异。Jetson 的统一内存消除了传统 PCIe
+复制的物理距离，却没有消除 CUDA API、kernel launch、默认流同步和 allocator 的固定成本；
+同时，CPU 和 GPU 需要与车辆软件栈共享同一功耗与内存系统。
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{x86 验证机与 Jetson 目标机的迁移相关差异。}
+  \label{tab:platform}
+  \begin{tabularx}{\textwidth}{@{}lYY@{}}
+    \toprule
+    维度 & \texttt{cuda-x86} 验证环境 & \texttt{cuda-jetson} 目标环境 \\
+    \midrule
+    CPU & Ryzen 9 9950X，16C/32T & 12$\times$ Cortex-A78AE，无 SMT \\
+    GPU & RTX 4070 Ti SUPER，\texttt{sm\_89} & Jetson Orin，\texttt{sm\_87} \\
+    工具链 & CUDA 12.4，GCC 12.3 & CUDA 12.2，GCC 11.4，aarch64 \\
+    内存路径 & 独立显存，经 PCIe 上传 & 统一物理内存，但 CUDA copy/sync 语义仍存在 \\
+    运行环境 & 可近似空闲测试 & ROS、LIO、YOLO、PointPillar、RViz、Xorg 持续运行 \\
+    CPU 并行 & 32 个逻辑线程可用 & 12T 会与业务任务争满全部物理核 \\
+    性能目标 & 验证算法正确性与桌面吞吐 & 在干扰下保持低尾延迟与可预测资源占用 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+迁移还暴露了一个构建层问题：上游 FastVGICPCuda 的旧 CMake 默认生成 \texttt{sm\_52}
+cubin。在 Jetson 对照构建中，需要显式增加 \texttt{-gencode=arch=compute\_87,code=sm\_87}，
+否则首次执行包含明显架构/JIT 冷启动，不能作为公平结果。该外部兼容补丁未混入本项目提交。
+
+\section{先在设备上跑通，再在真实负载中找瓶颈}
+
+\subsection{分支与工作目录迁移}
+
+设备端工作目录固定在 \texttt{fyc\_ws} 的 \texttt{src/small\_gicp} 子目录，分支固定为
+\texttt{cuda-jetson}。其绝对路径为：
+\begin{center}
+  \small\nolinkurl{/home/nvidia/fyc_ws/src/small_gicp}
+\end{center}
+由于直接网络 clone 不稳定，迁移先由本地仓库生成 Git bundle，
+在设备端恢复分支历史，再同步待验证源文件；构建目录与源码目录始终隔离。最终构建命令为：
+
+\begin{lstlisting}[style=reportcode,language=bash]
+cmake -S . -B build_jetson \
+  -DBUILD_CUDA=ON \
+  -DBUILD_WITH_OPENMP=ON \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=87
+cmake --build build_jetson -j4
+ctest --test-dir build_jetson --output-on-failure
+\end{lstlisting}
+
+构建后使用 \texttt{cuobjdump --list-elf} 确认最终 \texttt{odometry\_gpu} 内含
+\texttt{sm\_87} cubin，而不是依赖运行时 JIT。
+
+\subsection{先修复 CPU 对照，再谈 GPU 加速比}
+
+原 benchmark 的 \texttt{cpu-omp} 路径虽然接受 \texttt{--threads}，但目标未链接
+\texttt{OpenMP::OpenMP\_CXX}，实际可能退化为串行。迁移首先修复 CMake 链接，随后明确测试：
+
+\begin{itemize}
+  \item 12T：绑定 CPU 0--11；
+  \item 8T：\texttt{OMP\_PLACES=cores}、\texttt{OMP\_PROC\_BIND=spread}；
+  \item 两者均使用 \texttt{OMP\_WAIT\_POLICY=ACTIVE}，并记录为线程数而非“核心模式”。
+\end{itemize}
+
+短试验表明，GICP 12T 不绑定时 p50 为 139.7 ms，绑定后为 65.1 ms；8T 约 32.6 ms。
+这说明在持续业务负载下，线程位置本身就是基准协议的一部分。
+
+\subsection{调试与 profiling 能力}
+
+Jetson 的 GPU 调试设备属于 \texttt{debug} 组。将运行用户加入该组并重新登录后，
+Compute Sanitizer 从“GPU debugging features are disabled”恢复为可用。Nsight Systems
+可由普通用户采集 CUDA 时间线；Nsight Compute 的硬件计数器由管理员策略保护，因此使用
+\texttt{sudo ncu}。调试构建与 Release 性能构建分离，\texttt{-G} 从未用于正式计时。
+
+\section{Nsight 证明瓶颈在预处理与同步，而非 6×6 求解}
+
+迁移初期的 20 帧 Nsight Systems 数据显示，Point-to-Plane 与 GICP 的
+covariance shell 核函数分别占 GPU kernel 时间的 70.7\% 和 78.3\%，
+约 \SI{20}{ms/frame}。真正的 registration linearization kernel 占比不到 1\%。
+
+表~\ref{tab:nsight} 总结了 GICP 的关键前后变化。D2H 数据量下降并不意味着每次 LM
+同步已经完全消失；它意味着同步只携带最终小状态，而不再搬运全部 warp partial。
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{GICP 20 帧 Nsight 前后对照。quality12 保持原 shell 上限，balanced8 为显式性能配置。}
+  \label{tab:nsight}
+  \begin{tabular}{@{}lrrr@{}}
+    \toprule
+    指标 & 初始实现 & quality12 & balanced8 \\
+    \midrule
+    D2H 总量 & 48.1 MB & 0.035 MB & 0.034 MB \\
+    \texttt{cudaMalloc/cudaFree} & 453/453 & 67/67 & 67/67 \\
+    centroid 时间 & 2.48 ms/帧 & 1.29 ms/帧 & 1.29 ms/帧 \\
+    covariance 时间 & 20.49 ms/帧 & 18.69 ms/帧 & 9.60 ms/帧 \\
+    covariance achieved occupancy & 57.9\% & 60.9\% & 73.2\% \\
+    covariance compute throughput & 55.1\% & 55.1\% & 64.0\% \\
+    covariance memory throughput & 34.9\% & 33.5\% & 40.1\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+该诊断决定了优化顺序：先消除分配和大块 D2H，再优化 centroid 与 covariance；CPU 上的
+6×6 LDLT 只处理极小矩阵，不是第一优先级。
+
+\section{数据传输与生命周期优化先于算子微调}
+
+\subsection{GpuBuffer 从“尺寸即分配”改为“尺寸与容量分离”}
+
+\texttt{cuda-x86} 中，\texttt{GpuBuffer::resize()} 在尺寸变化时执行
+\texttt{cudaFree + cudaMalloc}。连续 LiDAR 帧的点数略有波动，因此即使算法相同也会触发
+全局 allocator 与隐式同步。Jetson 版本增加 \texttt{capacity\_}：请求尺寸不超过容量时
+只更新逻辑长度；move constructor/assignment 同时转移指针、长度与容量。
+
+这个改动本身很小，却改变了后续所有 scratch buffer、hash table 和点云容器的生命周期。
+新增单元测试验证缩小到 0、再扩回容量内时，device pointer 不发生变化。
+
+\subsection{source/target 点云与 Downsampler 双缓冲}
+
+原实现每帧创建局部 \texttt{GpuCloud} 与 \texttt{Downsampler}，注册后将临时 cloud move
+成 target；旧 target 立即析构。Jetson 版本把 source、target 和 downsampler 提升为
+odometry engine 成员，并采用如下循环：
+
+\begin{lstlisting}[style=reportcode,language=C++]
+downsampler.prepare_input(source);
+source.upload_from_host(frame);
+downsampler.run(source, frame.size(), resolution);
+
+const auto result = reg.align(target, source, ...);
+std::swap(target, source);
+\end{lstlisting}
+
+\texttt{prepare\_input()} 将上一帧的大 raw allocation 和紧凑 centroid allocation 交换回
+自然用途。配对算法只在前两帧建立双缓冲，随后不再为点云主存储按帧分配。
+
+\subsection{warp partial 在 GPU 上完成第二级归约}
+
+线性化 kernel 仍由每个 warp 写 43 个量：$H\in\mathbb{R}^{6\times6}$、
+$b\in\mathbb{R}^{6}$ 与 error。x86 基线下载 $N_{warp}\times43$ 个 double 后由 CPU 求和；
+Jetson 版本增加 GPU final reduction：
+
+\begin{itemize}
+  \item normal pass 只下载最终 43 个 double；
+  \item error-only pass 只下载 1 个 double；
+  \item Point-to-Plane、GICP 和 VGICP 使用 device reduction；
+  \item ICP 工作较轻，额外 reduction kernel 经 A/B 反而慢约 2\%，因此保留可复用的
+        host staging。这是有意的性能自适应，不是遗漏。
+\end{itemize}
+
+\subsection{VGICP scan-to-scan map 双缓冲}
+
+scan-to-scan 原来每帧构造一个新 \texttt{VoxelHashMap}，注册后销毁旧 target map。
+Jetson 版本新增 \texttt{clear()}：以 device memset 清空 key、sum、count 与 live counter，
+但保留表与 scratch 容量；odometry 同时维护 source map 和 target map，插入、注册后交换指针。
+这使 s2s 的无损质量模式相对初始版本获得约 19\% p50 改善。
+
+代码审查同时修复了旧扩容路径：新 hash table 的 key 会清空，但新 sum/count payload
+未显式置零；长序列首次 grow 后可能累计到未初始化值。Jetson 版本在 rehash 前补齐 device memset。
+
+\section{SM87 内核调优把预处理从瓶颈变成优势}
+
+\subsection{一个 warp 处理一个 voxel centroid}
+
+原 centroid kernel 为每个 voxel 启动一个 256-thread block，而测试数据平均每个 voxel
+只有约 5 个原始点。Jetson 版本改为一个 warp 对应一个 voxel、一个 block 同时处理 8 个
+voxel，并用 warp shuffle 完成 fp64 reduction。完整轨迹与旧 centroid 逐元素一致，
+kernel 时间约降低 48\%。最后一个有效 run boundary 也直接留在 device，移除一次 D2H
+和一次 H2D。
+
+\subsection{闭式最小特征向量与 Jacobi 稳健回退}
+
+法向量/协方差需要对称 $3\times3$ 矩阵的最小特征向量。原路径最多执行 16 轮 Jacobi，
+每轮包含 \texttt{atan2/sin/cos}。新路径使用闭式对称特征值公式，并从
+$A-\lambda_{min}I$ 的三组行叉乘中选择最长向量；若最小 eigen-gap 太小或残差超限，
+则回退 Jacobi。
+
+第一次闭式实现通过 31/32 测试，但单个近退化点的最大 covariance 相对误差为 0.0648，
+高于 0.05 门槛。工程处理不是放宽测试，而是增加 eigen-gap 与残差门槛；修正后 32/32 通过，
+完整轨迹相对 Jacobi 的最大差低于 \SI{0.4}{\milli\metre}/\ang{0.004}。
+
+\subsection{四 warp block 与显式 shell 配置}
+
+SM87 上依次测试 4、8、16 warp/block：4 warp 最快，16 warp 慢约 5\%--8\%。最终
+\texttt{COV\_WARPS=4}，block size 为 128。较小 block 提高了不规则 shell/hash 分支下的
+调度余量。
+
+约 2.2\%--2.6\% 的稀疏点在 shell 12 仍不能严格获得 20 个邻居，却贡献了大量空 voxel
+探测。因此 shell 上限改为显式参数：
+
+\begin{itemize}
+  \item \texttt{--cov\_max\_shell 12}：默认质量基线；
+  \item \texttt{--cov\_max\_shell 8}：Jetson balanced；
+  \item 6：aggressive 可选；
+  \item 4：实验模式，100 帧最大旋转差约 \ang{0.17}，不推荐。
+\end{itemize}
+
+\section{失败实验说明“更 GPU 化”不等于更快}
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{未进入最终实现的实验及原因。}
+  \begin{tabularx}{\textwidth}{@{}lYY@{}}
+    \toprule
+    实验 & 观察 & 决策 \\
+    \midrule
+    64 元素 warp-bitonic top-k & 29/29 测试通过，但稀疏命中使完整排序网络比少量 lane-0 插入慢 12\%--15\% & 回退 \\
+    对所有因子强制 GPU final reduction & P2P/GICP/VGICP 获益，轻量 ICP 因多一次 kernel 约慢 2\% & ICP 使用复用 host staging \\
+    shell 4 & 速度最高，但相对 shell12 最大旋转差升至约 \ang{0.17} & 仅实验，不推荐 \\
+    机械 CUDA Graph 固定展开 & LM accept/reject 动态改变 lambda 与 transform；固定展开可能从 5--9 次有效迭代膨胀至 200 个候选 pass & 不保留 \\
+    直接称 FastVGICPCuda 为纯 GPU & 默认 covariance 邻域来自 CPU parallel KD-tree & 报告为 CPU/GPU 混合路径 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+这些结果体现了迁移的基本原则：GPU 化的目标是减少端到端依赖与资源竞争，而不是增加
+kernel 数量。任何通过测试但变慢的方案都必须回退。
+
+\section{交错区组验证证明优化在干扰下成立}
+
+\subsection{指标与比较口径}
+
+验证数据为 KITTI odometry 00 的 000000--000099，共 100 帧。每次进程运行中，首帧用于
+target/context 预热，不计入统计；后 99 帧的计时包含 downsampling、法向量/协方差、近邻、
+完整 LM 与同步，不含文件 I/O。
+
+主矩阵使用 10 个区组。算法起始位置和每个算法内部的配置顺序都轮换；速度比先按同一区组
+计算 $t_{comparator}/t_{CUDA}$，再取 10 个比值中位数和 50,000 次固定种子 bootstrap
+区间。慢运行不删除。该设计降低了后台负载随时间变化导致的顺序偏差。
+
+\subsection{代码与设备门槛}
+
+\begin{itemize}
+  \item 本机辅助回归与 Jetson 设备端均为 32/32 CTest 通过；
+  \item downsample、covariance、ICP/GICP 和 voxel map 分别通过 Compute Sanitizer memcheck，0 errors；
+  \item 380 份原始 JSON 和 380 条 100-pose 轨迹通过完整性、单调性、FPS 反算与 headline 重算；
+  \item quality12 对保存 base 的最大 100 帧差低于 \SI{0.4}{\milli\metre}/\ang{0.004}；
+  \item 最终二进制经 \texttt{cuobjdump} 确认为 native \texttt{sm\_87}。
+\end{itemize}
+
+\section{最终结果：quality12 全面超过 CPU8}
+
+图~\ref{fig:latency} 使用从零开始的统一横轴展示最终 p50。CPU12 的长条反映其与业务线程
+争满 12 核；不能把它解释为 small\_gicp 在空载设备上的固有线程缩放。balanced8 的橙色条
+是显式近似预处理配置，而不是 GPU 线程数；ICP 不需要 covariance，因此两种 GPU 配置相同。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}
+    \begin{axis}[
+      xbar,
+      width=0.80\textwidth,
+      height=9.2cm,
+      xmin=0,
+      xmax=110,
+      xlabel={p50 延迟（ms/帧，越低越好）},
+      symbolic y coords={VGICP s2s,VGICP model,GICP,Point-to-Plane,ICP},
+      ytick=data,
+      yticklabel style={font=\small},
+      xticklabel style={font=\small},
+      xmajorgrids=true,
+      grid style={draw=ReportGrid},
+      axis line style={draw=ReportMuted},
+      tick style={draw=ReportMuted},
+      bar width=4.1pt,
+      enlarge y limits=0.14,
+      legend style={font=\small,draw=none,at={(0.5,-0.17)},anchor=north,legend columns=2,
+                    /tikz/every even column/.append style={column sep=1em}}
+    ]
+      \addplot+[fill=ReportDarkGray,draw=ReportDarkGray] coordinates {
+        (101.34,ICP) (67.59,Point-to-Plane) (57.02,GICP) (58.24,VGICP model) (52.38,VGICP s2s)};
+      \addplot+[fill=ReportLightGray,draw=ReportLightGray] coordinates {
+        (43.25,ICP) (31.85,Point-to-Plane) (27.80,GICP) (33.72,VGICP model) (27.10,VGICP s2s)};
+      \addplot+[fill=ReportBlue,draw=ReportBlue] coordinates {
+        (23.85,ICP) (29.48,Point-to-Plane) (26.03,GICP) (23.16,VGICP model) (22.79,VGICP s2s)};
+      \addplot+[fill=ReportOrange,draw=ReportOrange] coordinates {
+        (23.85,ICP) (22.18,Point-to-Plane) (18.11,GICP) (15.97,VGICP model) (15.84,VGICP s2s)};
+      \legend{small\_gicp 12T,small\_gicp 8T,CUDA quality12,CUDA balanced8}
+    \end{axis}
+  \end{tikzpicture}
+  \caption{持续业务负载下的最终端到端 p50，10 次运行中位数。balanced8 是 covariance shell=8 的显式近似配置；ICP 不使用该参数。精确值与区间见表~\ref{tab:final-performance}。}
+  \label{fig:latency}
+\end{figure}
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{优化后完整性能矩阵。p50/p95 为 10 次 run-level 指标的中位数，单位 ms/帧。}
+  \label{tab:final-performance}
+  \begin{tabular}{@{}lrrrrr@{}}
+    \toprule
+    算法 & CPU12 p50 & CPU8 p50 & quality12 p50/p95 & balanced8 p50/p95 & balanced FPS \\
+    \midrule
+    ICP & 101.34 & 43.25 & 23.85 / 33.97 & 23.85 / 33.97 & 41.3 \\
+    Point-to-Plane & 67.59 & 31.85 & 29.48 / 44.43 & 22.18 / 33.40 & 43.5 \\
+    GICP & 57.02 & 27.80 & 26.03 / 38.31 & 18.11 / 27.97 & 52.5 \\
+    VGICP model & 58.24 & 33.72 & 23.16 / 32.74 & 15.97 / 23.84 & 61.3 \\
+    VGICP s2s & 52.38 & 27.10 & 22.79 / 32.71 & 15.84 / 22.45 & 63.3 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{相对 small\_gicp 8T 的区组配对 p50 加速。括号内为 95\% bootstrap 区间。}
+  \begin{tabular}{@{}lcc@{}}
+    \toprule
+    算法 & quality12 vs 8T & balanced8 vs 8T \\
+    \midrule
+    ICP & 1.89$\times$ (1.62, 2.45) & 同 quality12 \\
+    Point-to-Plane & 1.15$\times$ (1.09, 1.17) & 1.50$\times$ (1.44, 1.55) \\
+    GICP & 1.10$\times$ (1.06, 1.17) & 1.55$\times$ (1.49, 1.69) \\
+    VGICP model & 1.52$\times$ (1.46, 1.55) & 2.18$\times$ (2.13, 2.23) \\
+    VGICP s2s & 1.22$\times$ (1.16, 1.24) & 1.73$\times$ (1.69, 1.82) \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+FastVGICPCuda 只参与共同的 VGICP scan-to-scan。其默认 CPU parallel KD-tree + GPU 路径
+p50 为 42.87 ms；本项目 quality12/balanced8 为 22.79/15.84 ms，即分别快
+\metric{1.98 倍和 2.83 倍}。这是一项端到端实现对照，不是逐算子同构比较。
+
+\subsection{balanced8 的数值边界}
+
+\begin{table}[H]
+  \centering
+  \small
+  \caption{balanced8 相对 quality12 的 100 帧实现间差异。没有使用 KITTI ground truth。}
+  \begin{tabular}{@{}lrr@{}}
+    \toprule
+    算法 & 最大平移差 & 最大旋转差 \\
+    \midrule
+    Point-to-Plane & 3.37 cm & 0.058$^\circ$ \\
+    GICP & 1.73 cm & 0.035$^\circ$ \\
+    VGICP model & 1.35 cm & 0.034$^\circ$ \\
+    VGICP s2s & 2.75 cm & 0.048$^\circ$ \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+如果应用尚未基于 ground truth 验证该差异，部署应选择默认 quality12；balanced8 是经过
+确定性与相对轨迹检查的性能选项，不是对绝对定位精度的证明。
+
+\section{局限性、工程经验与后续工作}
+
+\subsection{局限性与稳健性}
+
+\begin{itemize}
+  \item 所有 Jetson 数字描述的是约 15--20 分钟观测窗口内的条件性能；后台负载强度变化仍会扩大区间。
+  \item 配置按区组交错但不能同时运行，轮换顺序与配对比值只能降低、不能消除时间漂移。
+  \item Tegra telemetry 给出整体 GPU 利用率，不能精确归因到 YOLO、PointPillar 或 RViz。
+  \item 100 帧轨迹检查是实现一致性，不是 KITTI ground-truth APE/RPE；完整 4541 帧仍需复验 balanced8。
+  \item LM accept/reject 与 6×6 LDLT 仍在 CPU。当前回传已经很小；下一步若继续 GPU 化，
+        应设计持久 cooperative optimizer，而不是机械增加 kernel。
+\end{itemize}
+
+\subsection{可迁移到其他 CUDA 项目的经验}
+
+\begin{enumerate}
+  \item \textbf{先保证对照路径真实。}如果 CPU OpenMP 实际没有链接，任何 speedup 都无意义。
+  \item \textbf{先看 API 时间线，再看 kernel 指令。}allocator、同步和对象生命周期可能比核心数学更贵。
+  \item \textbf{嵌入式 GPU 的并发环境是产品的一部分。}空载最快配置不一定是业务负载下最稳配置。
+  \item \textbf{质量折中必须成为显式 API。}默认 quality12 保持基线，balanced8 通过命令行选择并进入 JSON 报告。
+  \item \textbf{GPU 化需要 A/B 门槛。}bitonic top-k 与 ICP final reduction 都说明“更多 kernel”可能更慢。
+  \item \textbf{每次优化都要有数值回退。}闭式 eigen 使用 gap/residual 检查回退 Jacobi，而不是放宽 parity 测试。
+\end{enumerate}
+
+\subsection{建议的后续工作}
+
+\begin{enumerate}
+  \item 在完整 KITTI-00 4541 帧上分别运行 quality12、balanced8，并计算 ground-truth APE/RPE。
+  \item 为 covariance shell 构建稀疏度/停止层统计，按传感器密度自动建议而非自动替换 shell cap。
+  \item 设计 device-resident LM 状态与 cooperative persistent kernel，评估是否值得消除最后的 CPU 控制环。
+  \item 将 32 项测试、Compute Sanitizer smoke 和短区组性能回归纳入 Jetson CI。
+  \item 在不同 nvpmodel 功耗模式下报告 ms/frame 与能量/帧，而不仅是 MAXN 吞吐。
+\end{enumerate}
+
+\section{复现与代码阅读路线}
+
+\subsection{复现质量与平衡模式}
+
+\begin{lstlisting}[style=reportcode,language=bash]
+# Quality baseline: original covariance shell cap.
+./build_jetson/cuda/odometry_gpu <velodyne_dir> \
+  --exec full-gpu --engine gicp \
+  --cov_max_shell 12 --max_frames 100 \
+  --report quality12.json --traj quality12.txt
+
+# Jetson balanced profile: explicit approximation.
+./build_jetson/cuda/odometry_gpu <velodyne_dir> \
+  --exec full-gpu --engine gicp \
+  --cov_max_shell 8 --max_frames 100 \
+  --report balanced8.json --traj balanced8.txt
+\end{lstlisting}
+
+\subsection{推荐代码阅读顺序}
+
+\begin{enumerate}
+  \item \path{cuda/include/sgc/core/buffer.hpp}：size/capacity 与 move 语义；
+  \item \path{cuda/src/voxel/downsample.cu}：storage exchange、warp centroid 与 device boundary；
+  \item \path{cuda/src/reg/linearize.cu}：GPU final reduction 与 ICP 自适应路径；
+  \item \path{cuda/src/preproc/covariance.cu}：闭式 eigen、Jacobi fallback、4-warp launch 与 shell cap；
+  \item \path{cuda/src/voxel/voxel_hash_map.cu}：clear/reuse、grow 初始化；
+  \item \path{cuda/bench/odometry_gpu.cpp}：完整帧生命周期与 profile 选择；
+  \item \path{cuda/test/}：每项优化对应的数值和生命周期门槛。
+\end{enumerate}
+
+查看 GitHub 上的完整迁移提交：
+\href{https://github.com/Functionhx/small_gicp/commit/6e836f60c04e2cf40069b25384b15764ac7757e2}{
+\texttt{Functionhx/small\_gicp@6e836f6}}。
+
+\appendix
+\section{证据文件与校验状态}
+
+本报告随源码保存三份聚合证据：
+
+\begin{itemize}
+  \item \path{evidence/optimized_full_matrix_summary.json}：200 份最终矩阵 JSON 的聚合；
+  \item \path{evidence/base_vs_optimized_summary.json}：180 份旧新 A/B JSON 的聚合；
+  \item \path{evidence/report_validation.json}：9 项独立完整性与计算检查，0 失败。
+\end{itemize}
+
+最终矩阵和 A/B summary 的 SHA-256 分别为：
+
+\begin{lstlisting}[style=reportcode]
+492ca18817c68c2ac5b49a69f2c5b7e2dfb2c01bd736a9d218ee2e4bc6cfa995
+bc41323ac019f0f0cd09ed21f7248b5426f1bc3f5f0a6a8d4ca1c49b3e111c81
+\end{lstlisting}
+
+验证结论为“可分享，但必须保留并发负载、balanced8 非 ground-truth 验证、fast 预处理不同”
+三项 caveat。报告中的全部 headline 数字均已从原始 JSON 独立重算。
+
+\end{document}
